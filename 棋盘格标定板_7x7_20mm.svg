@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="297mm" viewBox="0 0 210 297">
+  <title>Camera Calibration Checkerboard - 7x7 squares, 20 mm per square</title>
+  <desc>Print at 100 percent scale. Checkerboard size is 140 mm by 140 mm with 6 by 6 inner corners.</desc>
+
+  <rect x="0" y="0" width="210" height="297" fill="white"/>
+
+  <!-- Keep all explanatory text outside the checkerboard. -->
+  <text x="105" y="18" text-anchor="middle" font-family="Arial, sans-serif" font-size="5" fill="black">
+    Camera Calibration Checkerboard
+  </text>
+  <text x="105" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="3.5" fill="black">
+    7 x 7 squares | 20 mm square size | 6 x 6 inner corners | board: 140 x 140 mm
+  </text>
+
+  <!-- 7 by 7 checkerboard, each square exactly 20 mm. -->
+  <g transform="translate(35,70)" shape-rendering="crispEdges">
+    <rect x="0" y="0" width="140" height="140" fill="white" stroke="black" stroke-width="0.5"/>
+    <rect x="0" y="0" width="20" height="20" fill="black"/>
+    <rect x="40" y="0" width="20" height="20" fill="black"/>
+    <rect x="80" y="0" width="20" height="20" fill="black"/>
+    <rect x="120" y="0" width="20" height="20" fill="black"/>
+
+    <rect x="20" y="20" width="20" height="20" fill="black"/>
+    <rect x="60" y="20" width="20" height="20" fill="black"/>
+    <rect x="100" y="20" width="20" height="20" fill="black"/>
+
+    <rect x="0" y="40" width="20" height="20" fill="black"/>
+    <rect x="40" y="40" width="20" height="20" fill="black"/>
+    <rect x="80" y="40" width="20" height="20" fill="black"/>
+    <rect x="120" y="40" width="20" height="20" fill="black"/>
+
+    <rect x="20" y="60" width="20" height="20" fill="black"/>
+    <rect x="60" y="60" width="20" height="20" fill="black"/>
+    <rect x="100" y="60" width="20" height="20" fill="black"/>
+
+    <rect x="0" y="80" width="20" height="20" fill="black"/>
+    <rect x="40" y="80" width="20" height="20" fill="black"/>
+    <rect x="80" y="80" width="20" height="20" fill="black"/>
+    <rect x="120" y="80" width="20" height="20" fill="black"/>
+
+    <rect x="20" y="100" width="20" height="20" fill="black"/>
+    <rect x="60" y="100" width="20" height="20" fill="black"/>
+    <rect x="100" y="100" width="20" height="20" fill="black"/>
+
+    <rect x="0" y="120" width="20" height="20" fill="black"/>
+    <rect x="40" y="120" width="20" height="20" fill="black"/>
+    <rect x="80" y="120" width="20" height="20" fill="black"/>
+    <rect x="120" y="120" width="20" height="20" fill="black"/>
+  </g>
+
+  <!-- Printed-size verification bar: this line must measure exactly 20 mm. -->
+  <g stroke="black" fill="none" stroke-width="0.4">
+    <line x1="35" y1="225" x2="55" y2="225"/>
+    <line x1="35" y1="222" x2="35" y2="228"/>
+    <line x1="55" y1="222" x2="55" y2="228"/>
+  </g>
+  <text x="45" y="233" text-anchor="middle" font-family="Arial, sans-serif" font-size="3.5" fill="black">
+    verification line = 20 mm
+  </text>
+
+  <text x="105" y="252" text-anchor="middle" font-family="Arial, sans-serif" font-size="3.5" fill="black">
+    Print at 100% / Actual size. Do not use Fit to page.
+  </text>
+  <text x="105" y="259" text-anchor="middle" font-family="Arial, sans-serif" font-size="3.5" fill="black">
+    Mount on a flat rigid board before calibration.
+  </text>
+</svg>

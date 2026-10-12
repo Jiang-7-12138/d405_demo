@@ -1,0 +1,12 @@
+﻿{
+  "name": "T_base_camera_example",
+  "description": "Replace this identity matrix with the calibrated transform from D405 camera frame to robot base frame. Units are meters.",
+  "source_frame": "camera",
+  "target_frame": "robot_base",
+  "matrix": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}
