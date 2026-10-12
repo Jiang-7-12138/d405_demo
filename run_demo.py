@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import csv
+import json
 from collections import deque
 import os
 import time
@@ -26,6 +27,7 @@ from open3d_live_viewer import Open3DLiveViewer, Open3DUnavailable, clean_point_
 from pointcloud import depth_to_points_sampled, fill_small_depth_holes, mask_to_points, pixel_to_camera_xyz, robust_mask_stats, roi_mask
 from pointcloud_viewer import draw_3d_reconstruction, write_ply_ascii
 from robot_frame import camera_point_to_robot_base, load_transform_json
+from realtime_geometry import build_vision_result
 from segmenter import HSVSegmenter, PhantomLesionSegmenter, PhantomMaterialMaskSegmenter, PhantomMaterialSegmenter
 from visualization import draw_labeled_mask, draw_named_masks, draw_text_lines, hstack_resize, mask_centroid, overlay_mask
 
@@ -78,10 +80,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--voxel-mm", type=float, default=1.5, help="Voxel size for Open3D cleanup, in millimeters.")
     parser.add_argument("--use-depth-refine", action="store_true", help="Refine all class masks using D405 depth layers.")
     parser.add_argument("--base-from-camera", default=None, help="JSON file containing T_base_camera for robot-base output.")
+    parser.add_argument("--vision-output-jsonl", default="vision_detections.jsonl", help="Append automatic vision results here; empty disables file output.")
+    parser.add_argument("--vision-output-hz", type=float, default=5.0, help="Maximum vision output rate.")
+    parser.add_argument("--obstacle-margin-mm", type=float, default=5.0, help="Inflation added to each organ 3D bound.")
     parser.add_argument(
         "--mask-mode",
         choices=["none", "roi", "hsv", "lesion", "offline-lesions", "liver", "kidney", "bowel", "omentum", "gallbladder", "vessel", "all"],
-        default="none",
+        default="all",
     )
     parser.add_argument("--lesion-hue1", type=int, nargs=2, default=[0, 14], metavar=("LOW", "HIGH"))
     parser.add_argument("--lesion-hue2", type=int, nargs=2, default=[155, 179], metavar=("LOW", "HIGH"))
@@ -106,8 +111,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--coordinate-classes",
-        default="lesion",
-        help="Comma-separated classes used for 3D coordinate output in --mask-mode all. Use 'all' to output every class.",
+        default="all",
+        help="Comma-separated classes used for 3D coordinate output in --mask-mode all. Default: all.",
     )
     return parser.parse_args()
 
@@ -357,6 +362,11 @@ def main() -> None:
     }
     csv_path = record_dir / "measurements.csv"
     entities_csv_path = record_dir / "entity_states.csv"
+    vision_output_path = record_dir / args.vision_output_jsonl if args.vision_output_jsonl else None
+    if vision_output_path is not None:
+        vision_output_path.parent.mkdir(parents=True, exist_ok=True)
+    vision_output_period = 1.0 / max(args.vision_output_hz, 0.1)
+    last_vision_output_time = 0.0
     save_csv_header(csv_path)
     save_entities_csv_header(entities_csv_path)
     base_from_camera = load_transform_json(args.base_from_camera)
@@ -587,6 +597,16 @@ def main() -> None:
                 lesion_state = all_entity_states.get("lesion")
                 if lesion_state and lesion_state["valid"]:
                     lesion_center_camera_m = lesion_state["camera_m"]
+                now = time.monotonic()
+                if vision_output_path is not None and now - last_vision_output_time >= vision_output_period:
+                    vision_result = build_vision_result(
+                        frame.timestamp_ms, all_masks, depth, frame.intrinsics,
+                        args.min_depth_mm / 1000.0, args.max_depth_mm / 1000.0,
+                        base_from_camera, args.obstacle_margin_mm / 1000.0,
+                    )
+                    with vision_output_path.open("a", encoding="utf-8") as output:
+                        output.write(json.dumps(vision_result, separators=(",", ":"), allow_nan=False) + "\n")
+                    last_vision_output_time = now
 
             lines = [
                 f"intr fx={frame.intrinsics.fx:.1f} fy={frame.intrinsics.fy:.1f} cx={frame.intrinsics.cx:.1f} cy={frame.intrinsics.cy:.1f}",

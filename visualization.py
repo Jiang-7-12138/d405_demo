@@ -94,14 +94,16 @@ def draw_named_masks(
         out = cv2.addWeighted(out, 1.0, layer, alpha, 0.0)
 
         mask_u8 = mask.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = [c for c in contours if cv2.contourArea(c) >= 40]
+        contour_method = cv2.CHAIN_APPROX_NONE if name == "lesion" else cv2.CHAIN_APPROX_SIMPLE
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, contour_method)
+        if name != "lesion":
+            contours = [c for c in contours if cv2.contourArea(c) >= 40]
         if not contours:
             continue
         largest = max(contours, key=cv2.contourArea)
         if name == "lesion":
-            cv2.drawContours(out, [largest], -1, (255, 255, 255), 5, cv2.LINE_AA)
-            cv2.drawContours(out, [largest], -1, color, 2, cv2.LINE_AA)
+            cv2.drawContours(out, contours, -1, (255, 255, 255), 5, cv2.LINE_8)
+            cv2.drawContours(out, contours, -1, color, 2, cv2.LINE_8)
         else:
             cv2.drawContours(out, [largest], -1, color, 2, cv2.LINE_AA)
 
