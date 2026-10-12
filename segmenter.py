@@ -260,76 +260,111 @@ class PhantomLesionSegmenter(Segmenter):
 
 
 class PaintedLesionSegmenter(Segmenter):
-    """Detector for the newly painted official phantom lesion target.
+    """Detector for the painted lesion on the dark red liver.
 
-    The lesion patch is still red-brown like the liver, so a plain red HSV mask
-    is too broad. This detector first finds the large liver-like component, then
-    searches inside it for compact, darker and more saturated local peaks.
+    On the live D405 view the lesion is the lighter red square in the liver
+    groove. It has the same hue as the liver, but its value is about 90 while
+    the surrounding liver stays near 60-75. A darker-blob rule therefore locks
+    onto the bowel tip instead of this patch.
     """
 
-    def __init__(self, min_area: float = 350.0, max_area: float = 18000.0) -> None:
+    def __init__(self, min_area: float = 2500.0, max_area: float = 16000.0) -> None:
         self.min_area = min_area
         self.max_area = max_area
 
-    def predict(self, color_bgr: np.ndarray) -> list[np.ndarray]:
+    def predict(
+        self,
+        color_bgr: np.ndarray,
+        exclusion_mask: np.ndarray | None = None,
+        liver_mask: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
         hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         img_h, img_w = h.shape
-        yy, xx = np.indices((img_h, img_w))
+        red = (h <= 12) | (h >= 170)
 
-        red = (h <= 14) | (h >= 170)
-        liver_like = red & (s >= 45) & (v >= 45) & (v <= 190)
-        liver_like = PhantomMaterialSegmenter._keep_components(
-            PhantomMaterialSegmenter._clean(liver_like, open_size=5, close_size=25),
-            min_area=max(2500, int(0.01 * img_h * img_w)),
+        if liver_mask is not None and np.count_nonzero(liver_mask) >= 800:
+            return self._predict_on_liver(v, s, red, liver_mask)
+
+        dark_liver = red & (s >= 100) & (v >= 35) & (v <= 84)
+        dark_liver = PhantomMaterialSegmenter._keep_components(
+            PhantomMaterialSegmenter._clean(dark_liver, open_size=5, close_size=21),
+            min_area=max(1800, int(0.004 * img_h * img_w)),
             max_components=2,
         )
-        if not np.any(liver_like):
+        if not np.any(dark_liver):
             return []
 
-        circle_mask = self._hough_circle_mask(color_bgr, hsv, liver_like)
-        if circle_mask is not None:
-            return [circle_mask]
+        near_liver = cv2.dilate(dark_liver.astype(np.uint8), np.ones((21, 21), np.uint8)).astype(bool)
+        candidate = red & near_liver & (s >= 80) & (v >= 78) & (v <= 125)
+        if exclusion_mask is not None:
+            exclusion = cv2.dilate(exclusion_mask.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+            candidate &= ~exclusion
+        candidate = PhantomMaterialSegmenter._clean(candidate, open_size=3, close_size=21)
+        liver_material = red & near_liver & (s >= 70) & (v >= 30) & (v <= 140)
 
-        # Local contrast separates the raised target from the surrounding liver.
-        v_blur = cv2.GaussianBlur(v, (0, 0), 19).astype(np.int16)
-        s_blur = cv2.GaussianBlur(s, (0, 0), 19).astype(np.int16)
-        candidate = liver_like & red & (s >= 95) & (v >= 35) & (v <= 135)
-        candidate &= ((v_blur - v.astype(np.int16)) >= 3) | ((s.astype(np.int16) - s_blur) >= 10)
-
-        # Suppress the lower bowel/edge shadows. The lesion patch is on the
-        # visible liver surface, not on the front lower soft-tissue loop.
-        candidate &= yy < 0.62 * img_h
-        candidate &= xx > 0.16 * img_w
-        candidate &= xx < 0.76 * img_w
-
-        candidate = PhantomMaterialSegmenter._clean(candidate, open_size=3, close_size=11)
         contours, _ = cv2.findContours(candidate.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         scored: list[tuple[float, np.ndarray]] = []
         for contour in contours:
-            area = float(cv2.contourArea(contour))
+            if cv2.contourArea(contour) < 400:
+                continue
+            hull = cv2.convexHull(contour)
+            x, y, w, h_box = cv2.boundingRect(hull)
+            aspect = w / max(1.0, float(h_box))
+            if aspect < 0.55 or aspect > 1.85:
+                continue
+            hull_mask = np.zeros(candidate.shape, dtype=np.uint8)
+            cv2.drawContours(hull_mask, [hull], -1, 255, thickness=cv2.FILLED)
+            filled = hull_mask.astype(bool) & liver_material
+            area = float(np.count_nonzero(filled))
+            hull_area = float(np.count_nonzero(hull_mask))
             if area < self.min_area or area > self.max_area:
                 continue
-            x, y, w, h_box = cv2.boundingRect(contour)
-            aspect = w / max(1.0, float(h_box))
-            if aspect < 0.45 or aspect > 2.4:
+            if hull_area <= 0 or area / hull_area < 0.55:
                 continue
-            perimeter = float(cv2.arcLength(contour, True))
-            circularity = float(4.0 * np.pi * area / (perimeter * perimeter)) if perimeter > 1.0 else 0.0
             fill = area / max(1.0, float(w * h_box))
-            if fill < 0.22:
+            if fill < 0.45:
                 continue
-            one = np.zeros(candidate.shape, dtype=np.uint8)
-            cv2.drawContours(one, [contour], -1, 255, thickness=cv2.FILLED)
-            cx = x + w * 0.5
-            cy = y + h_box * 0.5
-            center_prior = 1.0 - min(0.8, abs(cx - 0.38 * img_w) / max(1.0, 0.45 * img_w))
-            upper_prior = 1.0 if cy < 0.50 * img_h else 0.55
-            score = area * max(circularity, 0.08) * max(fill, 0.2) * center_prior * upper_prior
-            scored.append((score, one.astype(bool)))
+            score = area * fill
+            scored.append((score, filled))
 
         scored.sort(key=lambda item: item[0], reverse=True)
-        return [m for _, m in scored[:3]]
+        return [m for _, m in scored[:1]]
+
+    def _predict_on_liver(
+        self,
+        v: np.ndarray,
+        s: np.ndarray,
+        red: np.ndarray,
+        liver_mask: np.ndarray,
+    ) -> list[np.ndarray]:
+        median_v = float(np.median(v[liver_mask]))
+        candidate = liver_mask & red & (s >= 60)
+        candidate &= v.astype(np.int16) >= (median_v + 12)
+        candidate &= v.astype(np.int16) <= (median_v + 45)
+        candidate = PhantomMaterialSegmenter._clean(candidate, open_size=3, close_size=15)
+        contours, _ = cv2.findContours(candidate.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        scored: list[tuple[float, np.ndarray]] = []
+        for contour in contours:
+            if cv2.contourArea(contour) < 400:
+                continue
+            hull = cv2.convexHull(contour)
+            x, y, w, h_box = cv2.boundingRect(hull)
+            aspect = w / max(1.0, float(h_box))
+            if aspect < 0.55 or aspect > 1.85:
+                continue
+            hull_mask = np.zeros(candidate.shape, dtype=np.uint8)
+            cv2.drawContours(hull_mask, [hull], -1, 255, thickness=cv2.FILLED)
+            filled = hull_mask.astype(bool) & liver_mask
+            area = float(np.count_nonzero(filled))
+            if area < self.min_area or area > self.max_area:
+                continue
+            fill = area / max(1.0, float(w * h_box))
+            if fill < 0.45:
+                continue
+            scored.append((area * fill, filled))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [m for _, m in scored[:1]]
 
     def _hough_circle_mask(self, color_bgr: np.ndarray, hsv: np.ndarray, liver_like: np.ndarray) -> np.ndarray | None:
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
@@ -489,7 +524,6 @@ class PhantomMaterialSegmenter:
         hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
         h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         img_h, img_w = h.shape
-        yy, xx = np.indices((img_h, img_w))
         empty = np.zeros(color_bgr.shape[:2], dtype=bool)
 
         red = (h <= 14) | (h >= 170)
@@ -497,29 +531,21 @@ class PhantomMaterialSegmenter:
         # F: hard omentum, the yellow stalk and lumpy yellow barrier in the
         # middle of the painted model. Segment it before bowel so the peach
         # bowel mask does not merge through the yellow parts.
-        omentum_raw = (h >= 14) & (h <= 36) & (s >= 70) & (v >= 75) & (v <= 255)
-        omentum_raw &= (xx > 0.18 * img_w) & (xx < 0.66 * img_w) & (yy > 0.34 * img_h) & (yy < 0.78 * img_h)
+        omentum_raw = (h >= 18) & (h <= 38) & (s >= 95) & (v >= 75) & (v <= 255)
         omentum = self._keep_components(
             self._clean(omentum_raw, open_size=3, close_size=11),
             min_area=max(300, int(0.0008 * img_h * img_w)),
             max_components=3,
         )
 
-        # B: soft bowel-like obstacles. The new paint is peach/orange. Keep the
-        # mask on the visible tube surface and avoid white supports/background.
-        bowel_raw = (h >= 2) & (h <= 16) & (s >= 55) & (s <= 165) & (v >= 120) & (v <= 245)
-        bowel_raw &= (yy > 0.43 * img_h) | ((xx > 0.64 * img_w) & (yy < 0.42 * img_h))
-        bowel_raw &= ~omentum
-        bowel = self._keep_components(
-            self._clean(bowel_raw, open_size=3, close_size=7),
-            min_area=max(1200, int(0.0015 * img_h * img_w)),
-            max_components=4,
-        )
+        # Liver and colon share the same red hue. A closer, brighter liver
+        # crosses V=100 and used to be swallowed by the bowel gate. Split them
+        # by shape: the liver is a solid mass, the colon is a curved tube.
+        liver, bowel = self._split_liver_and_bowel(red, s, v, omentum)
 
         # C: gallbladder is the dark green/gray oval near the lower middle. The
         # mask intentionally accepts low saturation because the paint is muted.
-        gall_roi = (xx > 0.43 * img_w) & (xx < 0.70 * img_w) & (yy > 0.38 * img_h) & (yy < 0.72 * img_h)
-        gall_raw = (h >= 35) & (h <= 100) & (s >= 18) & (v >= 35) & (v <= 185) & gall_roi
+        gall_raw = (h >= 38) & (h <= 100) & (s >= 45) & (v >= 25) & (v <= 195)
         gallbladder = self._keep_components(
             self._clean(gall_raw, open_size=5, close_size=19),
             min_area=250,
@@ -527,42 +553,26 @@ class PhantomMaterialSegmenter:
         )
 
         # D: small red/blue vessel or forbidden-zone markings on the white tray.
-        vessel_roi = (xx > 0.52 * img_w) & (xx < 0.64 * img_w) & (yy > 0.43 * img_h) & (yy < 0.56 * img_h)
         red_mark = ((h <= 9) | (h >= 170)) & (s >= 90) & (v >= 40) & (v <= 185)
         blue_mark = (h >= 88) & (h <= 135) & (s >= 45) & (v >= 35) & (v <= 230)
-        vessel = vessel_roi & (red_mark | blue_mark)
-        vessel &= ~gallbladder
+        vessel = red_mark | blue_mark
+        vessel &= ~gallbladder & ~liver & ~bowel & ~omentum
         vessel = self._keep_components(
             self._clean(vessel, open_size=3, close_size=5),
             min_area=70,
             max_components=8,
+            max_area=max(900, int(0.003 * img_h * img_w)),
         )
 
-        lesion_masks = PaintedLesionSegmenter().predict(color_bgr)
+        lesion_masks = PaintedLesionSegmenter().predict(color_bgr, liver_mask=liver)
         lesion = lesion_masks[0] if lesion_masks else empty.copy()
+        liver = liver & ~lesion & ~gallbladder & ~vessel & ~omentum
 
-        # A: liver/body shell. Keep the large red-brown liver surface, then
-        # subtract known obstacles and the lesion target so their centers remain
-        # independent in downstream CSV/state outputs.
-        liver_raw = red & (s >= 45) & (v >= 45) & (v <= 190)
-        liver_raw &= yy < 0.68 * img_h
-        liver_raw &= ~bowel & ~gallbladder & ~vessel & ~lesion & ~omentum
-        liver = self._keep_components(
-            self._clean(liver_raw, open_size=5, close_size=25),
-            min_area=max(4000, int(0.008 * img_h * img_w)),
-            max_components=2,
-        )
-
-        # No stable standalone kidney color is visible in the supplied painted
-        # reference image. Keep a conservative detector for future frames where
-        # the kidney is painted purple/rose; otherwise report not found.
-        kidney_raw = (h >= 145) & (h <= 172) & (s >= 35) & (v >= 55) & (v <= 220)
-        kidney_raw &= ~liver & ~bowel & ~gallbladder & ~vessel & ~lesion & ~omentum
-        kidney = self._keep_components(
-            self._clean(kidney_raw, open_size=5, close_size=15),
-            min_area=max(800, int(0.001 * img_h * img_w)),
-            max_components=1,
-        )
+        # This five-part STL set has no kidney. The pale block in the recording
+        # is a support, and the tray edge is brighter still. Leave kidney empty
+        # until a part with its own color is in view. A low-saturation rule here
+        # labels the tray wall as kidney.
+        kidney = empty.copy()
 
         return {
             "liver": liver,
@@ -574,6 +584,42 @@ class PhantomMaterialSegmenter:
             "lesion": lesion,
         }
 
+    def _split_liver_and_bowel(
+        self,
+        red: np.ndarray,
+        s: np.ndarray,
+        v: np.ndarray,
+        omentum: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        body = red & (s >= 40) & (v >= 35) & (v <= 235) & ~omentum
+        body = self._clean(body, open_size=5, close_size=9)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(body.astype(np.uint8), 8)
+        liver = np.zeros(body.shape, dtype=bool)
+        bowel_parts: list[tuple[int, np.ndarray]] = []
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 1200:
+                continue
+            comp = labels == idx
+            contours, _ = cv2.findContours(comp.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+            solidity = float(cv2.contourArea(contour)) / max(1.0, hull_area)
+            # A solid organ stays liver even when exposure lifts it above the
+            # old V=100 bowel cutoff. The colon's C shape stays well below this.
+            is_liver = (area >= 8000 and solidity >= 0.62) or (area >= 3500 and solidity >= 0.80)
+            if is_liver:
+                liver |= comp
+            else:
+                bowel_parts.append((area, comp))
+        bowel = np.zeros(body.shape, dtype=bool)
+        bowel_parts.sort(key=lambda item: item[0], reverse=True)
+        for _, comp in bowel_parts[:4]:
+            bowel |= comp
+        return liver, bowel
+
     @staticmethod
     def _clean(mask: np.ndarray, open_size: int, close_size: int) -> np.ndarray:
         out = mask.astype(np.uint8) * 255
@@ -584,13 +630,18 @@ class PhantomMaterialSegmenter:
         return out.astype(bool)
 
     @staticmethod
-    def _keep_components(mask: np.ndarray, min_area: int, max_components: int) -> np.ndarray:
+    def _keep_components(
+        mask: np.ndarray,
+        min_area: int,
+        max_components: int,
+        max_area: int | None = None,
+    ) -> np.ndarray:
         src = mask.astype(np.uint8)
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(src, 8)
         comps: list[tuple[int, int]] = []
         for idx in range(1, count):
             area = int(stats[idx, cv2.CC_STAT_AREA])
-            if area >= min_area:
+            if area >= min_area and (max_area is None or area <= max_area):
                 comps.append((area, idx))
         comps.sort(reverse=True)
         out = np.zeros(mask.shape, dtype=bool)
