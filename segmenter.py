@@ -338,11 +338,13 @@ class PaintedLesionSegmenter(Segmenter):
         red: np.ndarray,
         liver_mask: np.ndarray,
     ) -> list[np.ndarray]:
-        median_v = float(np.median(v[liver_mask]))
-        candidate = liver_mask & red & (s >= 60)
-        candidate &= v.astype(np.int16) >= (median_v + 12)
-        candidate &= v.astype(np.int16) <= (median_v + 45)
-        candidate = PhantomMaterialSegmenter._clean(candidate, open_size=3, close_size=15)
+        # The square is only a local bright patch. One side of the liver is
+        # also brighter from the lamp, so a global median cutoff swallows it.
+        blur = cv2.GaussianBlur(v, (0, 0), 16)
+        candidate = liver_mask & red & (s >= 80)
+        candidate &= v.astype(np.int16) >= (blur.astype(np.int16) + 6)
+        candidate = PhantomMaterialSegmenter._clean(candidate, open_size=3, close_size=11)
+        liver_area = float(np.count_nonzero(liver_mask))
         contours, _ = cv2.findContours(candidate.astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         scored: list[tuple[float, np.ndarray]] = []
         for contour in contours:
@@ -357,7 +359,7 @@ class PaintedLesionSegmenter(Segmenter):
             cv2.drawContours(hull_mask, [hull], -1, 255, thickness=cv2.FILLED)
             filled = hull_mask.astype(bool) & liver_mask
             area = float(np.count_nonzero(filled))
-            if area < self.min_area or area > self.max_area:
+            if area < self.min_area or area > self.max_area or area > 0.22 * liver_area:
                 continue
             fill = area / max(1.0, float(w * h_box))
             if fill < 0.45:
@@ -528,35 +530,50 @@ class PhantomMaterialSegmenter:
 
         red = (h <= 14) | (h >= 170)
 
-        # F: hard omentum, the yellow stalk and lumpy yellow barrier in the
-        # middle of the painted model. Segment it before bowel so the peach
-        # bowel mask does not merge through the yellow parts.
-        omentum_raw = (h >= 18) & (h <= 38) & (s >= 95) & (v >= 75) & (v <= 255)
+        # Colors sampled from the current phantom photo:
+        # omentum H18-20 S220-250 V150-175, bowel H6-9 S130-165 V130-181,
+        # liver H3-6 S160-220 V76-124, gallbladder H78-81 S140-160 V45-50.
+        omentum_raw = (h >= 14) & (h <= 36) & (s >= 150) & (v >= 90)
         omentum = self._keep_components(
             self._clean(omentum_raw, open_size=3, close_size=11),
             min_area=max(300, int(0.0008 * img_h * img_w)),
             max_components=3,
         )
 
-        # Liver and colon share the same red hue. A closer, brighter liver
-        # crosses V=100 and used to be swallowed by the bowel gate. Split them
-        # by shape: the liver is a solid mass, the colon is a curved tube.
-        liver, bowel = self._split_liver_and_bowel(red, s, v, omentum)
-
-        # C: gallbladder is the dark green/gray oval near the lower middle. The
-        # mask intentionally accepts low saturation because the paint is muted.
-        gall_raw = (h >= 38) & (h <= 100) & (s >= 45) & (v >= 25) & (v <= 195)
-        gallbladder = self._keep_components(
-            self._clean(gall_raw, open_size=5, close_size=19),
-            min_area=250,
-            max_components=2,
+        # Colon is the same hue family as the liver, but clearly brighter.
+        bowel_raw = red & (s >= 80) & (s <= 200) & (v >= 128) & (v <= 230)
+        bowel_raw &= ~omentum
+        bowel = self._keep_components(
+            self._clean(bowel_raw, open_size=3, close_size=9),
+            min_area=max(1200, int(0.0015 * img_h * img_w)),
+            max_components=3,
         )
 
-        # D: small red/blue vessel or forbidden-zone markings on the white tray.
-        red_mark = ((h <= 9) | (h >= 170)) & (s >= 90) & (v >= 40) & (v <= 185)
-        blue_mark = (h >= 88) & (h <= 135) & (s >= 45) & (v >= 35) & (v <= 230)
-        vessel = red_mark | blue_mark
-        vessel &= ~gallbladder & ~liver & ~bowel & ~omentum
+        liver_raw = red & (s >= 110) & (v >= 40) & (v <= 124)
+        liver_raw &= ~omentum & ~bowel
+        liver = self._keep_components(
+            self._clean(liver_raw, open_size=5, close_size=15),
+            min_area=max(4000, int(0.01 * img_h * img_w)),
+            max_components=1,
+        )
+
+        # Gallbladder is the dark green teardrop under the liver.
+        gall_raw = (h >= 65) & (h <= 105) & (s >= 80) & (v >= 25) & (v <= 110)
+        gall_raw &= ~omentum & ~liver & ~bowel
+        gallbladder = self._keep_components(
+            self._clean(gall_raw, open_size=5, close_size=15),
+            min_area=250,
+            max_components=1,
+        )
+
+        # D: small red/blue forbidden-zone marks on the white tray. Red liver
+        # pixels are not marks, so red candidates must sit on the pale board
+        # and outside the organs.
+        organ = cv2.dilate((liver | bowel | omentum | gallbladder).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
+        white_board = cv2.dilate(((s <= 40) & (v >= 140)).astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool)
+        red_mark = red & (s >= 100) & (v >= 40) & (v <= 170) & white_board
+        blue_mark = (h >= 90) & (h <= 140) & (s >= 50) & (v >= 30) & (v <= 180)
+        vessel = (red_mark | blue_mark) & ~organ
         vessel = self._keep_components(
             self._clean(vessel, open_size=3, close_size=5),
             min_area=70,

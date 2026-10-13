@@ -546,6 +546,12 @@ def main() -> None:
                     min_depth_m=args.min_depth_mm / 1000.0,
                     max_depth_m=args.max_depth_mm / 1000.0,
                 )
+                depth_center_px = None
+                if stats.valid and stats.median_camera_m is not None and float(stats.median_camera_m[2]) > 0:
+                    depth_center_px = (
+                        int(round((stats.median_camera_m[0] * frame.intrinsics.fx / stats.median_camera_m[2]) + frame.intrinsics.cx)),
+                        int(round((stats.median_camera_m[1] * frame.intrinsics.fy / stats.median_camera_m[2]) + frame.intrinsics.cy)),
+                    )
                 if mode == "offline-lesions" and offline_lesion_masks is not None:
                     shown_color = draw_offline_lesion_overlay(
                         shown_color,
@@ -555,9 +561,17 @@ def main() -> None:
                     )
                 elif mode == "all" and all_masks is not None:
                     draw_centers = {name: mask_geometry(mask)["center_px"] for name, mask in all_masks.items()}
-                    shown_color = draw_named_masks(shown_color, all_masks, centers=draw_centers, label_names=coordinate_classes)
+                    if depth_center_px is not None:
+                        draw_centers["lesion"] = depth_center_px
+                    shown_color = draw_named_masks(
+                        shown_color,
+                        all_masks,
+                        centers=draw_centers,
+                        label_names=set(all_masks),
+                        center_names={"lesion"},
+                    )
                 elif mode == "lesion":
-                    shown_color = draw_labeled_mask(shown_color, active_mask, label="lesion")
+                    shown_color = draw_labeled_mask(shown_color, active_mask, label="lesion", center_px=depth_center_px)
                 else:
                     shown_color = overlay_mask(shown_color, active_mask)
                 if stats.valid:
@@ -643,21 +657,12 @@ def main() -> None:
             elif state.mask_mode == "offline-lesions":
                 lines.append("red 3x3 lesion board not detected")
             if mode == "all" and all_masks is not None:
-                centers = []
-                for name in coordinate_classes:
-                    center = mask_centroid(all_masks.get(name))
-                    if center is not None:
-                        centers.append(f"{name}=({center[0]},{center[1]})")
-                if centers:
-                    lines.append("centers px: " + " | ".join(centers[:3]))
-                    if len(centers) > 3:
-                        lines.append("centers px: " + " | ".join(centers[3:]))
-                if all_entity_states is not None:
-                    valid3d = [name for name, state_info in all_entity_states.items() if state_info["valid"]]
-                    lines.append("3D valid: " + (", ".join(valid3d) if valid3d else "none"))
+                lesion_px = mask_centroid(all_masks.get("lesion"))
+                if lesion_px is not None:
+                    lines.append(f"lesion center px=({lesion_px[0]},{lesion_px[1]})")
 
             shown_color = draw_text_lines(shown_color, lines)
-            top = hstack_resize(shown_color, frame.depth_colormap)
+            top = np.hstack([shown_color, color.copy(), frame.depth_colormap])
             reconstruction_view = draw_3d_reconstruction(
                 display_pc_points,
                 display_pc_colors,

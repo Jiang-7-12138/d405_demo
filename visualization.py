@@ -20,6 +20,7 @@ def draw_labeled_mask(
     fill_color=(0, 255, 255),
     contour_color=(0, 0, 255),
     alpha: float = 0.28,
+    center_px: tuple[int, int] | None = None,
 ) -> np.ndarray:
     out = overlay_mask(color_bgr, mask, color=fill_color, alpha=alpha)
     if mask is None or not np.any(mask):
@@ -35,7 +36,11 @@ def draw_labeled_mask(
 
     largest = max(contours, key=cv2.contourArea)
     moments = cv2.moments(largest)
-    if moments["m00"]:
+    draw_lesion_size_circle(out, mask, center_px=center_px, color=contour_color)
+    if center_px is not None:
+        cx, cy = int(center_px[0]), int(center_px[1])
+        cv2.drawMarker(out, (cx, cy), contour_color, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
+    elif moments["m00"]:
         cx = int(round(moments["m10"] / moments["m00"]))
         cy = int(round(moments["m01"] / moments["m00"]))
         cv2.drawMarker(out, (cx, cy), contour_color, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
@@ -51,6 +56,35 @@ def draw_labeled_mask(
     cv2.rectangle(out, (text_x - 3, text_y - th - 7), (text_x + tw + 5, text_y + 5), (0, 0, 0), -1)
     cv2.putText(out, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return out
+
+
+def lesion_area_radius_px(mask: np.ndarray) -> int | None:
+    """Radius of a circle with the same area as the detected lesion mask."""
+    if mask is None or not np.any(mask):
+        return None
+    area = float(np.count_nonzero(mask))
+    if area < 1.0:
+        return None
+    return max(4, int(round(np.sqrt(area / np.pi))))
+
+
+def draw_lesion_size_circle(
+    image: np.ndarray,
+    mask: np.ndarray,
+    center_px: tuple[int, int] | None = None,
+    color: tuple[int, int, int] = (0, 0, 255),
+) -> None:
+    """Draw a size circle. center_px should be the depth-based point when available."""
+    radius = lesion_area_radius_px(mask)
+    if radius is None:
+        return
+    if center_px is None:
+        center_px = mask_centroid(mask)
+    if center_px is None:
+        return
+    center = (int(center_px[0]), int(center_px[1]))
+    cv2.circle(image, center, radius, (255, 255, 255), 4, cv2.LINE_AA)
+    cv2.circle(image, center, radius, color, 2, cv2.LINE_AA)
 
 
 def mask_centroid(mask: np.ndarray) -> tuple[int, int] | None:
@@ -70,6 +104,7 @@ def draw_named_masks(
     colors: dict[str, tuple[int, int, int]] | None = None,
     centers: dict[str, tuple[int, int] | None] | None = None,
     label_names: set[str] | None = None,
+    center_names: set[str] | None = None,
     alpha: float = 0.22,
 ) -> np.ndarray:
     out = color_bgr.copy()
@@ -104,11 +139,17 @@ def draw_named_masks(
         if name == "lesion":
             cv2.drawContours(out, contours, -1, (255, 255, 255), 5, cv2.LINE_8)
             cv2.drawContours(out, contours, -1, color, 2, cv2.LINE_8)
+            anchor = None
+            if centers is not None:
+                anchor = centers.get(name)
+            draw_lesion_size_circle(out, mask, center_px=anchor, color=color)
         else:
             cv2.drawContours(out, [largest], -1, color, 2, cv2.LINE_AA)
 
-        show_coordinates = label_names is None or name in label_names
+        if label_names is not None and name not in label_names:
+            continue
         x, y, w, h = cv2.boundingRect(largest)
+        show_coordinates = center_names is None or name in center_names
         if show_coordinates:
             centroid = centers.get(name) if centers is not None else mask_centroid(mask)
             if centroid is None:
@@ -120,12 +161,8 @@ def draw_named_masks(
             text_y = max(18, cy - 8)
         else:
             label = name
-            centroid = mask_centroid(mask)
-            if centroid is None:
-                centroid = (x + w // 2, y + h // 2)
-            cx, cy = centroid
-            text_x = max(0, min(color_bgr.shape[1] - 1, cx + 8))
-            text_y = max(18, min(color_bgr.shape[0] - 4, cy - 8))
+            text_x = max(0, min(color_bgr.shape[1] - 1, x))
+            text_y = max(18, y - 8)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         cv2.rectangle(out, (text_x - 3, text_y - th - 6), (text_x + tw + 4, text_y + 5), (0, 0, 0), -1)
         cv2.putText(out, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
