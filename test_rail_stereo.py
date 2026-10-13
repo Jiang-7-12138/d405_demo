@@ -3,7 +3,13 @@ import unittest
 import cv2
 import numpy as np
 
-from rail_stereo import RailIntrinsics, depth_from_disparity, reconstruct_pair, unrotate_ccw
+from rail_stereo import RailIntrinsics, classify_painted, depth_from_disparity, measure_classes, reconstruct_pair, unrotate_ccw
+
+
+def _hsv_patch(image_bgr: np.ndarray, x: int, y: int, w: int, h: int, hsv: tuple[int, int, int]) -> None:
+    patch = np.zeros((h, w, 3), np.uint8)
+    patch[:, :] = hsv
+    image_bgr[y : y + h, x : x + w] = cv2.cvtColor(patch, cv2.COLOR_HSV2BGR)
 
 
 def _texture(height: int, width: int) -> np.ndarray:
@@ -89,6 +95,28 @@ class RailStereoTests(unittest.TestCase):
         self.assertGreater(valid.size, 0.25 * center.size)
         self.assertAlmostEqual(float(np.median(valid)), expected_z, delta=expected_z * 0.08)
         self.assertGreater(result.points_m.shape[0], 100)
+
+    def test_painted_thresholds_label_organs_and_lesion_depth(self):
+        image = np.zeros((480, 640, 3), np.uint8)
+        _hsv_patch(image, 300, 80, 280, 280, (5, 180, 60))
+        _hsv_patch(image, 400, 160, 60, 60, (5, 180, 124))
+        _hsv_patch(image, 40, 80, 180, 280, (7, 150, 165))
+        _hsv_patch(image, 230, 180, 40, 90, (19, 240, 175))
+        _hsv_patch(image, 520, 390, 70, 70, (80, 160, 48))
+
+        masks = classify_painted(image)
+        self.assertGreater(int(np.count_nonzero(masks["liver"])), 4000)
+        self.assertGreater(int(np.count_nonzero(masks["bowel"])), 1200)
+        self.assertGreater(int(np.count_nonzero(masks["omentum"])), 300)
+        self.assertGreater(int(np.count_nonzero(masks["gallbladder"])), 250)
+
+        depth = np.zeros(image.shape[:2], np.float32)
+        depth[masks["liver"]] = 0.20
+        intr = RailIntrinsics(640, 480, 800, 800, 320, 240, np.zeros(5))
+        stats, _centers = measure_classes(masks, depth, intr)
+        self.assertAlmostEqual(stats["liver"]["median_depth_mm"], 200.0, delta=1.0)
+        self.assertEqual(len(stats["liver"]["center_camera_mm"]), 3)
+        self.assertIsNone(stats["kidney"]["center_camera_mm"])
 
 
 if __name__ == "__main__":

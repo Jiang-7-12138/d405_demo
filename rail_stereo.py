@@ -27,6 +27,8 @@ import numpy as np
 
 from io_utils import imwrite_unicode
 from pointcloud_viewer import write_ply_ascii
+from segmenter import PhantomMaterialSegmenter
+from visualization import draw_named_masks, mask_centroid
 
 
 @dataclass
@@ -55,6 +57,11 @@ class RailResult:
     colors_bgr: np.ndarray | None
     valid_pixels: int
     median_depth_m: float | None
+    reference_bgr: np.ndarray | None = None
+    intrinsics: RailIntrinsics | None = None
+
+
+CLASS_NAMES = ("liver", "kidney", "bowel", "omentum", "gallbladder", "vessel", "lesion")
 
 
 def imread_unicode(path: str | Path) -> np.ndarray:
@@ -224,7 +231,7 @@ def reconstruct_pair(
     valid = depth > 0
     valid_pixels = int(np.count_nonzero(valid))
     median = float(np.median(depth[valid])) if valid_pixels else None
-    return RailResult(depth, disparity, points, colors, valid_pixels, median)
+    return RailResult(depth, disparity, points, colors, valid_pixels, median, image_a, intr)
 
 
 def _depth_to_points(
@@ -251,26 +258,124 @@ def _depth_to_points(
     return points, colors
 
 
-def depth_preview(color_bgr: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
-    valid = depth_m > 0
+def depth_colormap(color_bgr: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
     preview = np.zeros_like(color_bgr)
-    if np.any(valid):
-        lo, hi = np.percentile(depth_m[valid], [5, 95])
-        span = max(float(hi - lo), 1e-6)
-        scaled = np.clip((depth_m - lo) / span, 0, 1)
-        gray = (scaled * 255).astype(np.uint8)
-        gray[~valid] = 0
-        preview = cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
-        preview[~valid] = 0
-    return np.hstack((color_bgr, preview))
+    valid = depth_m > 0
+    if not np.any(valid):
+        return preview
+    lo, hi = np.percentile(depth_m[valid], [5, 95])
+    span = max(float(hi - lo), 1e-6)
+    scaled = np.clip((depth_m - lo) / span, 0, 1)
+    gray = (scaled * 255).astype(np.uint8)
+    gray[~valid] = 0
+    preview = cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
+    preview[~valid] = 0
+    return preview
 
 
-def save_reconstruction(out_dir: str | Path, result: RailResult, image_a: np.ndarray, meta: dict) -> Path:
+def depth_preview(color_bgr: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
+    return np.hstack((color_bgr, depth_colormap(color_bgr, depth_m)))
+
+
+def classify_painted(color_bgr: np.ndarray) -> dict[str, np.ndarray]:
+    """Painted-phantom HSV classes. This uses color only, so one photo is enough."""
+    return PhantomMaterialSegmenter(profile="painted").predict_all(color_bgr)
+
+
+def _mask_median_camera(
+    mask: np.ndarray,
+    depth_m: np.ndarray,
+    intr: RailIntrinsics,
+) -> tuple[np.ndarray | None, tuple[int, int] | None]:
+    valid = mask.astype(bool) & np.isfinite(depth_m) & (depth_m > 0)
+    ys, xs = np.nonzero(valid)
+    if xs.size < 20:
+        return None, None
+    z = depth_m[ys, xs].astype(np.float32)
+    z_med = float(np.median(z))
+    mad = float(np.median(np.abs(z - z_med)))
+    keep = np.abs(z - z_med) <= max(0.004, 3.0 * mad)
+    if int(np.count_nonzero(keep)) >= 20:
+        xs, ys, z = xs[keep], ys[keep], z[keep]
+    x = (xs.astype(np.float32) - intr.cx) * z / intr.fx
+    y = (ys.astype(np.float32) - intr.cy) * z / intr.fy
+    xyz = np.array([float(np.median(x)), float(np.median(y)), float(np.median(z))], dtype=np.float64)
+    if xyz[2] <= 0:
+        return None, None
+    u = int(round(xyz[0] * intr.fx / xyz[2] + intr.cx))
+    v = int(round(xyz[1] * intr.fy / xyz[2] + intr.cy))
+    return xyz, (u, v)
+
+
+def measure_classes(
+    masks: dict[str, np.ndarray],
+    depth_m: np.ndarray | None = None,
+    intr: RailIntrinsics | None = None,
+) -> tuple[dict, dict[str, tuple[int, int]]]:
+    stats: dict = {}
+    centers: dict[str, tuple[int, int]] = {}
+    for name in CLASS_NAMES:
+        mask = masks.get(name)
+        pixels = 0 if mask is None else int(np.count_nonzero(mask))
+        centroid = mask_centroid(mask) if pixels else None
+        center_px = centroid
+        center_mm = None
+        median_mm = None
+        if pixels and depth_m is not None and intr is not None:
+            xyz, projected = _mask_median_camera(mask, depth_m, intr)
+            if xyz is not None and projected is not None:
+                center_mm = [round(float(v) * 1000.0, 2) for v in xyz]
+                median_mm = center_mm[2]
+                center_px = projected
+        if name == "lesion" and center_px is not None:
+            centers[name] = center_px
+        stats[name] = {
+            "pixels": pixels,
+            "centroid_px": None if centroid is None else [int(centroid[0]), int(centroid[1])],
+            "center_px": None if center_px is None else [int(center_px[0]), int(center_px[1])],
+            "median_depth_mm": median_mm,
+            "center_camera_mm": center_mm,
+        }
+    return stats, centers
+
+
+def highlight_lesion_points(
+    depth_m: np.ndarray,
+    colors_bgr: np.ndarray | None,
+    lesion_mask: np.ndarray | None,
+    stride: int,
+) -> np.ndarray | None:
+    if colors_bgr is None or lesion_mask is None or not np.any(lesion_mask):
+        return colors_bgr
+    step = max(1, int(stride))
+    ys = np.arange(0, depth_m.shape[0], step, dtype=np.int32)
+    xs = np.arange(0, depth_m.shape[1], step, dtype=np.int32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    valid = np.isfinite(depth_m[grid_y, grid_x]) & (depth_m[grid_y, grid_x] > 0)
+    flags = lesion_mask[grid_y, grid_x][valid]
+    if flags.shape[0] != colors_bgr.shape[0]:
+        return colors_bgr
+    colored = colors_bgr.copy()
+    colored[flags] = (0, 0, 255)
+    return colored
+
+
+def save_reconstruction(
+    out_dir: str | Path,
+    result: RailResult,
+    image_a: np.ndarray,
+    meta: dict,
+    class_overlay: np.ndarray | None = None,
+) -> Path:
     folder = Path(out_dir)
     folder.mkdir(parents=True, exist_ok=True)
     depth_mm = np.clip(np.round(result.depth_m * 1000.0), 0, 65535).astype(np.uint16)
     imwrite_unicode(str(folder / "depth_mm.png"), depth_mm)
-    imwrite_unicode(str(folder / "preview.png"), depth_preview(image_a, result.depth_m))
+    panels = [image_a, depth_colormap(image_a, result.depth_m)]
+    if class_overlay is not None:
+        imwrite_unicode(str(folder / "classes.png"), class_overlay)
+        panels = [class_overlay, image_a, depth_colormap(image_a, result.depth_m)]
+    imwrite_unicode(str(folder / "preview.png"), np.hstack(panels))
     np.save(str(folder / "depth_m.npy"), result.depth_m)
     write_ply_ascii(str(folder / "cloud.ply"), result.points_m, result.colors_bgr)
     (folder / "summary.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -386,11 +491,33 @@ def _build_parser() -> argparse.ArgumentParser:
     reconstruct.add_argument("--max-depth-mm", type=float, default=800.0)
     reconstruct.add_argument("--stride", type=int, default=2)
     reconstruct.add_argument("--out-dir", default="captures/rail_recon")
+
+    segment = sub.add_parser("segment", help="Painted HSV classes on one industrial-camera photo.")
+    segment.add_argument("--image", required=True)
+    segment.add_argument("--out-dir", default="captures/rail_classes")
     return parser
+
+
+def _write_classes(folder: Path, color_bgr: np.ndarray, masks: dict[str, np.ndarray], stats: dict, centers: dict) -> np.ndarray:
+    folder.mkdir(parents=True, exist_ok=True)
+    overlay = draw_named_masks(color_bgr, masks, centers=centers)
+    imwrite_unicode(str(folder / "classes.png"), overlay)
+    (folder / "classes.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    return overlay
 
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.command == "segment":
+        image = imread_unicode(args.image)
+        masks = classify_painted(image)
+        stats, centers = measure_classes(masks)
+        folder = _write_classes(Path(args.out_dir), image, masks, stats, centers)
+        found = [name for name, item in stats.items() if item["pixels"] > 0]
+        print("classes: " + (", ".join(found) if found else "none"))
+        print(f"wrote {folder}")
+        return
+
     if args.command == "calibrate":
         images = _collect_images(args.images)
         intr, rms = calibrate_intrinsics(images, tuple(args.inner_corners), args.square_mm / 1000.0)
@@ -416,23 +543,33 @@ def main() -> None:
         max_depth_m=args.max_depth_mm / 1000.0,
         stride=args.stride,
     )
+    reference = result.reference_bgr if result.reference_bgr is not None else image_a
+    used = result.intrinsics if result.intrinsics is not None else intr
+    masks = classify_painted(reference)
+    class_stats, centers = measure_classes(masks, result.depth_m, used)
+    result.colors_bgr = highlight_lesion_points(result.depth_m, result.colors_bgr, masks.get("lesion"), args.stride)
     meta = {
         "image_a": str(args.image_a),
         "image_b": str(args.image_b),
         "baseline_mm": args.baseline_mm,
         "axis": args.axis,
         "swapped": bool(args.swap),
-        "fx": intr.fx,
-        "fy": intr.fy,
-        "cx": intr.cx,
-        "cy": intr.cy,
+        "fx": used.fx,
+        "fy": used.fy,
+        "cx": used.cx,
+        "cy": used.cy,
         "valid_pixels": result.valid_pixels,
         "median_depth_mm": None if result.median_depth_m is None else result.median_depth_m * 1000.0,
         "points": int(result.points_m.shape[0]),
+        "classes": class_stats,
     }
-    folder = save_reconstruction(args.out_dir, result, image_a, meta)
+    overlay = draw_named_masks(reference, masks, centers=centers)
+    folder = save_reconstruction(args.out_dir, result, reference, meta, class_overlay=overlay)
+    (folder / "classes.json").write_text(json.dumps(class_stats, indent=2), encoding="utf-8")
+    found = [name for name, item in class_stats.items() if item["pixels"] > 0]
     median = "none" if result.median_depth_m is None else f"{result.median_depth_m * 1000.0:.1f} mm"
     print(f"valid pixels {result.valid_pixels}, median depth {median}, points {result.points_m.shape[0]}")
+    print("classes: " + (", ".join(found) if found else "none"))
     print(f"wrote {folder}")
 
 
