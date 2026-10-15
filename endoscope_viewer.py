@@ -5,8 +5,11 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from io_utils import imwrite_unicode
+from segmenter import PhantomMaterialSegmenter
+from visualization import draw_named_masks
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +31,13 @@ def backend_value(name: str) -> int:
     return cv2.CAP_ANY
 
 
+def recognize_frame(frame: np.ndarray, segmenter: PhantomMaterialSegmenter) -> tuple[np.ndarray, list[str]]:
+    """Draw the current painted-phantom classes. No depth, so the lesion circle uses the mask centroid."""
+    masks = segmenter.predict_all(frame)
+    found = [name for name, mask in masks.items() if mask is not None and np.any(mask)]
+    return draw_named_masks(frame, masks), found
+
+
 def main() -> None:
     args = parse_args()
     base = Path(__file__).resolve().parent
@@ -46,8 +56,11 @@ def main() -> None:
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"Opened camera index={args.index}, size={actual_w}x{actual_h}, fps={actual_fps:.1f}")
-    print("Keys: q/ESC quit | s snapshot | r start/stop video recording")
+    print("Keys: q/ESC quit | s snapshot | r start/stop video | m toggle painted recognition")
+    print("Recognition profile: painted (liver, bowel, omentum, gallbladder, vessel, lesion)")
 
+    segmenter = PhantomMaterialSegmenter(profile="painted")
+    show_masks = True
     writer = None
     video_path = None
     win = f"Endoscope index {args.index}"
@@ -60,22 +73,37 @@ def main() -> None:
                 print("Failed to read frame")
                 break
 
-            shown = frame.copy()
+            found: list[str] = []
+            if show_masks:
+                shown, found = recognize_frame(frame, segmenter)
+            else:
+                shown = frame.copy()
             status = "REC" if writer is not None else "LIVE"
-            cv2.putText(shown, f"{status} index={args.index} {frame.shape[1]}x{frame.shape[0]}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(shown, f"{status} index={args.index} {frame.shape[1]}x{frame.shape[0]}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+            mode = "painted" if show_masks else "raw"
+            classes = ",".join(found) if found else "none"
+            label = f"{status} {mode} {frame.shape[1]}x{frame.shape[0]} {classes}"
+            cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
             if writer is not None:
-                writer.write(frame)
+                writer.write(shown)
 
             cv2.imshow(win, shown)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
             if key == ord("s"):
-                path = record_dir / f"endoscope_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                path = record_dir / f"endoscope_{stamp}.png"
                 imwrite_unicode(str(path), frame)
+                overlay_path = record_dir / f"endoscope_{stamp}_overlay.png"
+                overlay, found_now = recognize_frame(frame, segmenter)
+                imwrite_unicode(str(overlay_path), overlay)
                 print(f"Saved snapshot: {path}")
+                print(f"Saved overlay: {overlay_path} classes={','.join(found_now) if found_now else 'none'}")
+            if key == ord("m"):
+                show_masks = not show_masks
+                print(f"Recognition {'on' if show_masks else 'off'}")
             if key == ord("r"):
                 if writer is None:
                     video_path = record_dir / f"endoscope_{time.strftime('%Y%m%d_%H%M%S')}.avi"
