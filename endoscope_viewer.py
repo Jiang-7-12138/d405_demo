@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
 import time
 from pathlib import Path
 
@@ -20,6 +22,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=30, help="Requested capture FPS.")
     parser.add_argument("--record-dir", default="captures", help="Directory for snapshots and videos.")
     parser.add_argument("--backend", choices=["any", "dshow", "msmf"], default="any")
+    parser.add_argument("--video", default="", help="Run recognition on this video file and save an overlay video. Skips the camera.")
+    parser.add_argument(
+        "--profile",
+        default="endoscope-bright",
+        choices=["endoscope", "endoscope-bright"],
+        help="endoscope-bright uses the brighter red dome from 20261015_213826. endoscope is the older darker dome.",
+    )
     return parser.parse_args()
 
 
@@ -31,11 +40,69 @@ def backend_value(name: str) -> int:
     return cv2.CAP_ANY
 
 
+def poll_key(keys: tuple[int, ...]) -> int:
+    """Read a key even when a Chinese IME would swallow cv2.waitKey."""
+    key_code = cv2.waitKey(1)
+    key = (key_code & 0xFF) if key_code >= 0 else -1
+    if os.name != "nt":
+        return key
+    user32 = ctypes.windll.user32
+    for virtual_key in keys:
+        if user32.GetAsyncKeyState(virtual_key) & 1:
+            return virtual_key
+    return key
+
+
 def recognize_frame(frame: np.ndarray, segmenter: PhantomMaterialSegmenter) -> tuple[np.ndarray, list[str]]:
     """Draw the current painted-phantom classes. No depth, so the lesion circle uses the mask centroid."""
     masks = segmenter.predict_all(frame)
     found = [name for name, mask in masks.items() if mask is not None and np.any(mask)]
-    return draw_named_masks(frame, masks), found
+    return draw_named_masks(frame, masks, center_names=set()), found
+
+
+def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
+    """Write one overlay video. Open that file to see the recognition result."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise SystemExit(f"Failed to open video: {video_path}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 1:
+        fps = 30.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    out_path = record_dir / f"endoscope_overlay_{video_path.stem}.avi"
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise SystemExit(f"Failed to create overlay video: {out_path}")
+
+    segmenter = PhantomMaterialSegmenter(profile=profile)
+    print(f"Recognition profile: {profile}")
+    print(f"Reading {video_path}")
+    print(f"Size {width}x{height}, fps={fps:.1f}, frames={frame_count}")
+    print(f"Writing {out_path}")
+    written = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            shown, found = recognize_frame(frame, segmenter)
+            classes = ",".join(found) if found else "none"
+            label = f"FILE {frame.shape[1]}x{frame.shape[0]} {classes}"
+            cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+            writer.write(shown)
+            written += 1
+            if written % 100 == 0:
+                print(f"  {written}/{frame_count}")
+    finally:
+        writer.release()
+        cap.release()
+    print(f"Done. Overlay video: {out_path} ({written} frames)")
+    print("Open that avi in the player to watch the recognition. It is not the live camera window.")
 
 
 def main() -> None:
@@ -43,6 +110,10 @@ def main() -> None:
     base = Path(__file__).resolve().parent
     record_dir = base / args.record_dir
     record_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.video:
+        replay_video(Path(args.video), record_dir, args.profile)
+        return
 
     cap = cv2.VideoCapture(args.index, backend_value(args.backend))
     if not cap.isOpened():
@@ -57,9 +128,14 @@ def main() -> None:
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"Opened camera index={args.index}, size={actual_w}x{actual_h}, fps={actual_fps:.1f}")
     print("Keys: q/ESC quit | s snapshot | r start/stop video | m toggle painted recognition")
-    print("Recognition profile: painted (liver, bowel, omentum, gallbladder, vessel, lesion)")
+    print("Letter keys do not need Fn. Click the image window first. Chinese input can be left on.")
+    print(f"Recognition profile: {args.profile}")
+    if args.profile == "endoscope-bright":
+        print("Lesion gate: bright red dome (H 0-8, S 80-165, V 165-240).")
+    else:
+        print("Lesion gate: darker saturated dome.")
 
-    segmenter = PhantomMaterialSegmenter(profile="painted")
+    segmenter = PhantomMaterialSegmenter(profile=args.profile)
     show_masks = True
     writer = None
     video_path = None
@@ -89,7 +165,7 @@ def main() -> None:
                 writer.write(shown)
 
             cv2.imshow(win, shown)
-            key = cv2.waitKey(1) & 0xFF
+            key = poll_key((0x1B, ord("q"), ord("s"), ord("r"), ord("m")))
             if key in (27, ord("q")):
                 break
             if key == ord("s"):
