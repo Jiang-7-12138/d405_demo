@@ -87,6 +87,50 @@ def draw_lesion_size_circle(
     cv2.circle(image, center, radius, color, 2, cv2.LINE_AA)
 
 
+def smooth_closed_contour(contour: np.ndarray, radius: float = 18.0) -> np.ndarray:
+    """Round a closed outline so ridges on the colon do not become a sawtooth."""
+    pts = contour.reshape(-1, 2).astype(np.float32)
+    if len(pts) < 8:
+        return contour
+    closed = np.vstack([pts, pts[:1]])
+    segment = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    distance = np.concatenate([[0.0], np.cumsum(segment)])
+    total = float(distance[-1])
+    if total < radius * 4:
+        return contour
+    samples = np.arange(0.0, total, 2.0)
+    xs = np.interp(samples, distance, closed[:, 0])
+    ys = np.interp(samples, distance, closed[:, 1])
+    win = max(3, int(round(radius)) | 1)
+    pad = win // 2
+    kernel = np.ones(win, dtype=np.float32) / float(win)
+
+    def circular_mean(values: np.ndarray) -> np.ndarray:
+        extended = np.concatenate([values[-pad:], values, values[:pad]])
+        return np.convolve(extended, kernel, mode="valid")[: len(values)]
+
+    smoothed = np.stack([circular_mean(xs), circular_mean(ys)], axis=1)
+    return np.round(smoothed).astype(np.int32).reshape(-1, 1, 2)
+
+
+def mask_interior_point(mask: np.ndarray, edge_margin: int = 36) -> tuple[int, int] | None:
+    """A point on the object itself, not in the hollow or on a cropped image edge."""
+    if mask is None or not np.any(mask):
+        return None
+    search = mask.astype(bool)
+    if edge_margin > 0 and min(search.shape) > edge_margin * 2:
+        inset = search.copy()
+        inset[:edge_margin, :] = False
+        inset[-edge_margin:, :] = False
+        inset[:, :edge_margin] = False
+        inset[:, -edge_margin:] = False
+        if np.any(inset):
+            search = inset
+    dist = cv2.distanceTransform(search.astype(np.uint8), cv2.DIST_L2, 5)
+    _min_val, _max_val, _min_loc, max_loc = cv2.minMaxLoc(dist)
+    return int(max_loc[0]), int(max_loc[1])
+
+
 def mask_centroid(mask: np.ndarray) -> tuple[int, int] | None:
     if mask is None or not np.any(mask):
         return None
@@ -137,14 +181,13 @@ def draw_named_masks(
             continue
         largest = max(contours, key=cv2.contourArea)
         if name == "lesion":
-            cv2.drawContours(out, contours, -1, (255, 255, 255), 5, cv2.LINE_8)
-            cv2.drawContours(out, contours, -1, color, 2, cv2.LINE_8)
             anchor = None
             if centers is not None:
                 anchor = centers.get(name)
             draw_lesion_size_circle(out, mask, center_px=anchor, color=color)
         else:
-            cv2.drawContours(out, [largest], -1, color, 2, cv2.LINE_AA)
+            drawn = [smooth_closed_contour(c, radius=42.0) if name == "bowel" else c for c in contours]
+            cv2.drawContours(out, drawn, -1, color, 2, cv2.LINE_AA)
 
         if label_names is not None and name not in label_names:
             continue
@@ -161,9 +204,25 @@ def draw_named_masks(
             text_y = max(18, cy - 8)
         else:
             label = name
-            text_x = max(0, min(color_bgr.shape[1] - 1, x))
-            text_y = max(18, y - 8)
+            if name == "bowel":
+                held = centers.get(name) if centers is not None else None
+                label_at = held if held is not None else mask_interior_point(mask)
+            else:
+                label_at = None
+            if label_at is None:
+                moments = cv2.moments(largest)
+                if moments["m00"]:
+                    label_at = (int(round(moments["m10"] / moments["m00"])), int(round(moments["m01"] / moments["m00"])))
+                else:
+                    label_at = (x + w // 2, y + h // 2)
+            text_x = int(label_at[0]) + 8
+            text_y = max(18, int(label_at[1]) - 8)
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        if name == "bowel" and not show_coordinates:
+            text_x = int(label_at[0]) - tw // 2
+            text_y = int(label_at[1]) + th // 2
+        text_x = max(0, min(color_bgr.shape[1] - tw - 4, text_x))
+        text_y = max(th + 6, min(color_bgr.shape[0] - 6, text_y))
         cv2.rectangle(out, (text_x - 3, text_y - th - 6), (text_x + tw + 4, text_y + 5), (0, 0, 0), -1)
         cv2.putText(out, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
     return out

@@ -498,11 +498,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def class_counts(stats: dict) -> dict:
+    """Pixel counts only. Coordinate fields stay out of the saved result for now."""
+    return {name: {"pixels": int(item["pixels"])} for name, item in stats.items()}
+
+
 def _write_classes(folder: Path, color_bgr: np.ndarray, masks: dict[str, np.ndarray], stats: dict, centers: dict) -> np.ndarray:
     folder.mkdir(parents=True, exist_ok=True)
-    overlay = draw_named_masks(color_bgr, masks, centers=centers)
+    overlay = draw_named_masks(color_bgr, masks, centers=centers, center_names=set())
     imwrite_unicode(str(folder / "classes.png"), overlay)
-    (folder / "classes.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    (folder / "classes.json").write_text(json.dumps(class_counts(stats), indent=2), encoding="utf-8")
     return overlay
 
 
@@ -561,11 +566,11 @@ def main() -> None:
         "valid_pixels": result.valid_pixels,
         "median_depth_mm": None if result.median_depth_m is None else result.median_depth_m * 1000.0,
         "points": int(result.points_m.shape[0]),
-        "classes": class_stats,
+        "classes": class_counts(class_stats),
     }
-    overlay = draw_named_masks(reference, masks, centers=centers)
+    overlay = draw_named_masks(reference, masks, centers=centers, center_names=set())
     folder = save_reconstruction(args.out_dir, result, reference, meta, class_overlay=overlay)
-    (folder / "classes.json").write_text(json.dumps(class_stats, indent=2), encoding="utf-8")
+    (folder / "classes.json").write_text(json.dumps(class_counts(class_stats), indent=2), encoding="utf-8")
     found = [name for name, item in class_stats.items() if item["pixels"] > 0]
     median = "none" if result.median_depth_m is None else f"{result.median_depth_m * 1000.0:.1f} mm"
     print(f"valid pixels {result.valid_pixels}, median depth {median}, points {result.points_m.shape[0]}")

@@ -439,11 +439,13 @@ class PhantomMaterialSegmenter:
     """
 
     def __init__(self, profile: str = "legacy") -> None:
-        if profile not in {"legacy", "painted"}:
+        if profile not in {"legacy", "painted", "endoscope", "endoscope-bright"}:
             raise ValueError(f"Unknown material profile: {profile}")
         self.profile = profile
 
     def predict_all(self, color_bgr: np.ndarray) -> dict[str, np.ndarray]:
+        if self.profile in {"endoscope", "endoscope-bright"}:
+            return self._predict_endoscope(color_bgr)
         if self.profile == "painted":
             return self._predict_painted(color_bgr)
 
@@ -601,6 +603,249 @@ class PhantomMaterialSegmenter:
             "lesion": lesion,
         }
 
+    def _predict_endoscope(self, color_bgr: np.ndarray) -> dict[str, np.ndarray]:
+        """Painted phantom under the close, bright endoscope light.
+
+        The scope pushes liver value above the D405 gate, so the old V<=124
+        rule kept only the darker square around the dome. Close and blur the
+        masks so the outline follows the organ instead of every pixel step.
+        """
+        hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        img_h, img_w = h.shape
+        empty = np.zeros(color_bgr.shape[:2], dtype=bool)
+        red = (h <= 16) | (h >= 170)
+
+        omentum_raw = (h >= 16) & (h <= 40) & (s >= 110) & (v >= 120)
+        omentum = self._keep_components(
+            self._smooth_mask(omentum_raw, close_size=27, blur=11),
+            min_area=max(400, int(0.001 * img_h * img_w)),
+            max_components=2,
+        )
+
+        # Liver is the saturated red organ (S >= 130). Bowel is the paler colon
+        # (S <= 125). Those gates do not share a color. Enclosed pale pixels, such
+        # as the lesion square, stay inside the liver. The colon outside does not,
+        # and the later close must not grow either outline back over the other.
+        liver_core = red & (s >= 130) & (v >= 40) & (v <= 210)
+        liver_body = self._fill_enclosed(liver_core)
+        bowel_raw = red & (s >= 40) & (s <= 125) & (v >= 158) & (v <= 245)
+        bowel_raw &= ~omentum & ~liver_body
+        bowel = self._keep_components(
+            self._smooth_mask(bowel_raw, close_size=35, blur=27),
+            min_area=max(1500, int(0.004 * img_h * img_w)),
+            max_components=2,
+        )
+        bowel &= ~liver_body
+
+        liver_raw = liver_body & ~omentum & ~bowel
+        liver = self._keep_components(
+            self._smooth_mask(liver_raw, close_size=35, blur=15),
+            min_area=max(4000, int(0.01 * img_h * img_w)),
+            max_components=1,
+        )
+        liver &= ~bowel
+
+        # Real gallbladder is a saturated green blob (H~90, S~205, V~70).
+        # A black tool under this light reads as dark olive (H~100, S~130, V~35)
+        # and used to take the gallbladder label. Keep only the bright green,
+        # then drop a long thin shaft if one still matches.
+        # Use the unsmoothed liver. The closed liver outline spreads onto the
+        # green organ and used to erase it. A leaf-shaped gallbladder is longer
+        # than 3:1, so the shaft reject must stay above that.
+        # A wide close was painting over the blue vessel next to the green organ.
+        gall_raw = (h >= 72) & (h <= 108) & (s >= 165) & (v >= 48) & (v <= 150)
+        gall_raw &= ~omentum & ~liver_raw & ~bowel
+        gallbladder = self._keep_components(
+            self._smooth_mask(gall_raw, close_size=9, blur=7),
+            min_area=200,
+            max_components=1,
+        )
+        gallbladder = self._drop_elongated(gallbladder, max_aspect=4.5)
+
+        border = np.zeros(h.shape, dtype=bool)
+        border[:8, :] = True
+        border[-8:, :] = True
+        border[:, :8] = True
+        border[:, -8:] = True
+        # Endoscope "white" is slightly blue (S around 50), and the painted
+        # vessel is a saturated blue patch of about a thousand pixels.
+        white_near = cv2.dilate(((s <= 80) & (v >= 165)).astype(np.uint8), np.ones((21, 21), np.uint8)).astype(bool)
+        blue_mark = (h >= 96) & (h <= 125) & (s >= 150) & (v >= 70) & (v <= 190)
+        # Subtract the kept gallbladder, not every pixel in its wide hue gate.
+        # The blue vessel sits at H~104, inside that gate, and used to be erased
+        # before its own area check.
+        vessel = blue_mark & white_near & ~liver_raw & ~bowel & ~omentum & ~gallbladder & ~border
+        vessel = self._keep_components(
+            self._clean(vessel, open_size=3, close_size=7),
+            min_area=200,
+            max_components=2,
+            max_area=3000,
+        )
+
+        if self.profile == "endoscope-bright":
+            lesion = self._endoscope_lesion_circle_bright(color_bgr, liver)
+        else:
+            lesion = self._endoscope_lesion_circle(color_bgr, liver)
+        liver = liver & ~lesion & ~gallbladder & ~vessel & ~omentum
+        return {
+            "liver": liver,
+            "kidney": empty.copy(),
+            "bowel": bowel,
+            "omentum": omentum,
+            "gallbladder": gallbladder,
+            "vessel": vessel,
+            "lesion": lesion,
+        }
+
+    @staticmethod
+    def _fill_enclosed(core: np.ndarray) -> np.ndarray:
+        """Close small gaps, then keep holes that are inside the organ."""
+        image = (core.astype(np.uint8) * 255)
+        image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+        filled = image.copy()
+        flood_mask = np.zeros((image.shape[0] + 2, image.shape[1] + 2), np.uint8)
+        if image[0, 0] == 0:
+            seed = (0, 0)
+        else:
+            empty = np.column_stack(np.nonzero(image == 0))
+            if empty.size == 0:
+                return image > 0
+            seed = (int(empty[0, 1]), int(empty[0, 0]))
+        cv2.floodFill(filled, flood_mask, seed, 255)
+        holes = filled == 0
+        return (image > 0) | holes
+
+    @staticmethod
+    def _smooth_mask(mask: np.ndarray, close_size: int, blur: int) -> np.ndarray:
+        image = mask.astype(np.uint8) * 255
+        if close_size > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+            image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled = np.zeros_like(image)
+        if contours:
+            cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
+        else:
+            filled = image
+        radius = max(3, int(blur) | 1)
+        filled = cv2.GaussianBlur(filled, (radius, radius), 0)
+        return filled >= 127
+
+    @staticmethod
+    def _endoscope_lesion_circle(color_bgr: np.ndarray, liver: np.ndarray) -> np.ndarray:
+        """Fit one circle to the raised red dome. The square groove is not the lesion.
+
+        The dome core is the darkest saturated red. A corner smear of the square
+        is larger but less saturated, and the lit liver is brighter, so neither
+        should take the circle.
+        """
+        circle = np.zeros(liver.shape, dtype=bool)
+        if int(np.count_nonzero(liver)) < 500:
+            return circle
+        hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        red = (hue <= 16) | (hue >= 170)
+        # The dome is a saturated core with a paler square around it. The lit
+        # liver has no pale ring, and the red smear at the square's corner is
+        # less saturated than the dome, so it loses when both are candidates.
+        core = liver & red & (sat >= 165) & (val >= 90) & (val <= 175)
+        core_u8 = cv2.morphologyEx(core.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(core_u8, 8)
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        best: np.ndarray | None = None
+        best_sat = -1.0
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 280 or area > 6500:
+                continue
+            width = int(stats[idx, cv2.CC_STAT_WIDTH])
+            height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            short = max(1, min(width, height))
+            if max(width, height) / short > 2.4:
+                continue
+            if area / max(1, width * height) < 0.28:
+                continue
+            comp = labels == idx
+            ring = cv2.dilate(comp.astype(np.uint8), ring_kernel).astype(bool) & ~comp & red
+            if int(np.count_nonzero(ring)) < 80:
+                continue
+            if float(np.median(sat[comp])) - float(np.median(sat[ring])) < 28:
+                continue
+            sat_med = float(np.median(sat[comp]))
+            if sat_med > best_sat:
+                best_sat = sat_med
+                best = comp
+        if best is None:
+            return circle
+        grown = cv2.dilate(best.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+        grown = grown.astype(bool) & liver & red & (val <= 190) & (sat >= 140)
+        contours, _ = cv2.findContours(grown.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return circle
+        (cx, cy), radius = cv2.minEnclosingCircle(max(contours, key=cv2.contourArea))
+        drawn = np.zeros(liver.shape, dtype=np.uint8)
+        cv2.circle(
+            drawn,
+            (int(round(cx)), int(round(cy))),
+            max(12, int(round(radius * 0.92))),
+            255,
+            thickness=cv2.FILLED,
+        )
+        return drawn.astype(bool)
+
+    @staticmethod
+    def _endoscope_lesion_circle_bright(color_bgr: np.ndarray, liver: np.ndarray) -> np.ndarray:
+        """Bright-red dome from the 2026-10-15 endoscope clip.
+
+        That dome reads about H 0-8, S 120-150, V 210-230. The older gate
+        keeps only a darker, more saturated core (S>=165, V<=175).
+        """
+        circle = np.zeros(liver.shape, dtype=bool)
+        if int(np.count_nonzero(liver)) < 500:
+            return circle
+        hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        red = (hue <= 8) | (hue >= 170)
+        blur = cv2.GaussianBlur(val, (0, 0), 18)
+        core = liver & red & (sat >= 80) & (sat <= 165) & (val >= 165) & (val <= 240)
+        core &= val.astype(np.int16) >= (blur.astype(np.int16) + 8)
+        core_u8 = cv2.morphologyEx(core.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(core_u8, 8)
+        best: np.ndarray | None = None
+        best_val = -1.0
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 500 or area > 9000:
+                continue
+            width = int(stats[idx, cv2.CC_STAT_WIDTH])
+            height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            short = max(1, min(width, height))
+            if max(width, height) / short > 2.0:
+                continue
+            if area / max(1, width * height) < 0.3:
+                continue
+            comp = labels == idx
+            val_med = float(np.median(val[comp]))
+            if val_med > best_val:
+                best_val = val_med
+                best = comp
+        if best is None:
+            return circle
+        contours, _ = cv2.findContours(best.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return circle
+        (cx, cy), radius = cv2.minEnclosingCircle(max(contours, key=cv2.contourArea))
+        drawn = np.zeros(liver.shape, dtype=np.uint8)
+        cv2.circle(
+            drawn,
+            (int(round(cx)), int(round(cy))),
+            max(12, int(round(radius))),
+            255,
+            thickness=cv2.FILLED,
+        )
+        return drawn.astype(bool) & liver
+
     def _split_liver_and_bowel(
         self,
         red: np.ndarray,
@@ -664,6 +909,23 @@ class PhantomMaterialSegmenter:
         out = np.zeros(mask.shape, dtype=bool)
         for _, idx in comps[:max_components]:
             out |= labels == idx
+        return out
+
+    @staticmethod
+    def _drop_elongated(mask: np.ndarray, max_aspect: float) -> np.ndarray:
+        """Remove shaft-like components. A gallbladder is a compact blob."""
+        src = mask.astype(np.uint8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(src, 8)
+        out = np.zeros(mask.shape, dtype=bool)
+        for idx in range(1, count):
+            comp = (labels == idx).astype(np.uint8)
+            contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            (_, _), (width, height), _ = cv2.minAreaRect(max(contours, key=cv2.contourArea))
+            short = max(1.0, min(width, height))
+            if max(width, height) / short <= max_aspect:
+                out |= labels == idx
         return out
 
     @staticmethod

@@ -11,7 +11,7 @@ import numpy as np
 
 from io_utils import imwrite_unicode
 from segmenter import PhantomMaterialSegmenter
-from visualization import draw_named_masks
+from visualization import draw_named_masks, lesion_area_radius_px, mask_centroid, mask_interior_point
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,11 +53,103 @@ def poll_key(keys: tuple[int, ...]) -> int:
     return key
 
 
-def recognize_frame(frame: np.ndarray, segmenter: PhantomMaterialSegmenter) -> tuple[np.ndarray, list[str]]:
-    """Draw the current painted-phantom classes. No depth, so the lesion circle uses the mask centroid."""
+class MaskHold:
+    """Keep a displayed mask from flickering by taking the recent-frame majority."""
+
+    def __init__(self, history: int = 7, hold_frames: int = 8) -> None:
+        self.history = max(1, int(history))
+        self.hold_frames = max(0, int(hold_frames))
+        self._frames: list[np.ndarray] = []
+        self._missing = 0
+        self._held: np.ndarray | None = None
+
+    def update(self, mask: np.ndarray | None) -> np.ndarray | None:
+        if mask is None or not np.any(mask):
+            self._missing += 1
+            if self._missing > self.hold_frames:
+                self._frames.clear()
+                self._held = None
+            return self._held
+        self._missing = 0
+        self._frames.append(mask.astype(bool))
+        self._frames = self._frames[-self.history :]
+        votes = np.sum(np.stack(self._frames, axis=0), axis=0)
+        self._held = votes >= (len(self._frames) + 1) // 2
+        return self._held
+
+
+class LesionCenterHold:
+    """Keep the displayed lesion center from twitching by a few pixels.
+
+    A new measurement inside the deadband leaves the held center unchanged.
+    A real move has to stay in the recent median before the held center steps.
+    A short gap keeps the last center instead of blinking off.
+    """
+
+    def __init__(self, deadband_px: float = 4.0, history: int = 9, hold_frames: int = 8) -> None:
+        self.deadband_px = float(deadband_px)
+        self.history = max(1, int(history))
+        self.hold_frames = max(0, int(hold_frames))
+        self._samples: list[tuple[float, float]] = []
+        self._held: tuple[int, int] | None = None
+        self._missing = 0
+
+    def update(self, center: tuple[int, int] | None) -> tuple[int, int] | None:
+        if center is None:
+            self._missing += 1
+            if self._missing > self.hold_frames:
+                self._samples.clear()
+                self._held = None
+            return self._held
+        self._missing = 0
+        self._samples.append((float(center[0]), float(center[1])))
+        self._samples = self._samples[-self.history :]
+        xs = sorted(sample[0] for sample in self._samples)
+        ys = sorted(sample[1] for sample in self._samples)
+        mid = len(xs) // 2
+        median = (xs[mid], ys[mid])
+        if self._held is None:
+            self._held = (int(round(median[0])), int(round(median[1])))
+            return self._held
+        shift = ((median[0] - self._held[0]) ** 2 + (median[1] - self._held[1]) ** 2) ** 0.5
+        if shift >= self.deadband_px:
+            self._held = (int(round(median[0])), int(round(median[1])))
+        return self._held
+
+
+def recognize_frame(
+    frame: np.ndarray,
+    segmenter: PhantomMaterialSegmenter,
+    center_hold: LesionCenterHold | None = None,
+    bowel_hold: MaskHold | None = None,
+    bowel_label_hold: LesionCenterHold | None = None,
+) -> tuple[np.ndarray, list[str], tuple[int, int] | None]:
+    """Draw the painted classes and a lesion center that stays put under small jitter."""
     masks = segmenter.predict_all(frame)
+    masks = dict(masks)
+    if bowel_hold is not None:
+        stable_bowel = bowel_hold.update(masks.get("bowel"))
+        if stable_bowel is not None:
+            masks["bowel"] = stable_bowel
     found = [name for name, mask in masks.items() if mask is not None and np.any(mask)]
-    return draw_named_masks(frame, masks, center_names=set()), found
+    raw_center = mask_centroid(masks.get("lesion"))
+    held = center_hold.update(raw_center) if center_hold is not None else raw_center
+    if held is not None and masks.get("lesion") is not None and np.any(masks["lesion"]):
+        radius = lesion_area_radius_px(masks["lesion"])
+        if radius is not None:
+            disk = np.zeros(masks["lesion"].shape, dtype=np.uint8)
+            cv2.circle(disk, held, radius, 255, thickness=cv2.FILLED)
+            masks["lesion"] = disk.astype(bool)
+    bowel_label = mask_interior_point(masks.get("bowel"))
+    if bowel_label_hold is not None:
+        bowel_label = bowel_label_hold.update(bowel_label)
+    shown = draw_named_masks(
+        frame,
+        masks,
+        centers={"lesion": held, "bowel": bowel_label},
+        center_names={"lesion"},
+    )
+    return shown, found, held
 
 
 def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
@@ -79,6 +171,9 @@ def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
         raise SystemExit(f"Failed to create overlay video: {out_path}")
 
     segmenter = PhantomMaterialSegmenter(profile=profile)
+    center_hold = LesionCenterHold()
+    bowel_hold = MaskHold()
+    bowel_label_hold = LesionCenterHold(deadband_px=8.0)
     print(f"Recognition profile: {profile}")
     print(f"Reading {video_path}")
     print(f"Size {width}x{height}, fps={fps:.1f}, frames={frame_count}")
@@ -89,9 +184,10 @@ def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
-            shown, found = recognize_frame(frame, segmenter)
+            shown, found, lesion_center = recognize_frame(frame, segmenter, center_hold, bowel_hold, bowel_label_hold)
             classes = ",".join(found) if found else "none"
-            label = f"FILE {frame.shape[1]}x{frame.shape[0]} {classes}"
+            center_text = f" lesion=({lesion_center[0]},{lesion_center[1]})" if lesion_center is not None else ""
+            label = f"FILE {frame.shape[1]}x{frame.shape[0]} {classes}{center_text}"
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
             writer.write(shown)
@@ -136,6 +232,9 @@ def main() -> None:
         print("Lesion gate: darker saturated dome.")
 
     segmenter = PhantomMaterialSegmenter(profile=args.profile)
+    center_hold = LesionCenterHold()
+    bowel_hold = MaskHold()
+    bowel_label_hold = LesionCenterHold(deadband_px=8.0)
     show_masks = True
     writer = None
     video_path = None
@@ -150,14 +249,16 @@ def main() -> None:
                 break
 
             found: list[str] = []
+            lesion_center = None
             if show_masks:
-                shown, found = recognize_frame(frame, segmenter)
+                shown, found, lesion_center = recognize_frame(frame, segmenter, center_hold, bowel_hold, bowel_label_hold)
             else:
                 shown = frame.copy()
             status = "REC" if writer is not None else "LIVE"
             mode = "painted" if show_masks else "raw"
             classes = ",".join(found) if found else "none"
-            label = f"{status} {mode} {frame.shape[1]}x{frame.shape[0]} {classes}"
+            center_text = f" lesion=({lesion_center[0]},{lesion_center[1]})" if lesion_center is not None else ""
+            label = f"{status} {mode} {frame.shape[1]}x{frame.shape[0]} {classes}{center_text}"
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -173,10 +274,11 @@ def main() -> None:
                 path = record_dir / f"endoscope_{stamp}.png"
                 imwrite_unicode(str(path), frame)
                 overlay_path = record_dir / f"endoscope_{stamp}_overlay.png"
-                overlay, found_now = recognize_frame(frame, segmenter)
+                overlay, found_now, lesion_center_now = recognize_frame(frame, segmenter, center_hold, bowel_hold, bowel_label_hold)
                 imwrite_unicode(str(overlay_path), overlay)
+                center_now = f" lesion=({lesion_center_now[0]},{lesion_center_now[1]})" if lesion_center_now is not None else ""
                 print(f"Saved snapshot: {path}")
-                print(f"Saved overlay: {overlay_path} classes={','.join(found_now) if found_now else 'none'}")
+                print(f"Saved overlay: {overlay_path} classes={','.join(found_now) if found_now else 'none'}{center_now}")
             if key == ord("m"):
                 show_masks = not show_masks
                 print(f"Recognition {'on' if show_masks else 'off'}")
