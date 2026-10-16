@@ -14,7 +14,7 @@ from ultralytics import YOLO
 
 from io_utils import imwrite_unicode
 
-DEFAULT_WEIGHTS = r"d:\xwechat_files\wxid_rm8x770aosqc12_90b8\msg\file\2026-10\best.pt"
+DEFAULT_WEIGHTS = str(Path(__file__).resolve().parent / "weights" / "best.pt")
 
 
 def parse_args() -> argparse.Namespace:
