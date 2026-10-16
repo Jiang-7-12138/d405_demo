@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from io_utils import imwrite_unicode
+from marker_frame import MarkerFrameHold, detect_marker_frame, draw_marker_frame
 from segmenter import PhantomMaterialSegmenter
 from visualization import draw_named_masks, lesion_area_radius_px, mask_centroid, mask_interior_point
 
@@ -171,6 +172,7 @@ def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
         raise SystemExit(f"Failed to create overlay video: {out_path}")
 
     segmenter = PhantomMaterialSegmenter(profile=profile)
+    marker_hold = MarkerFrameHold()
     center_hold = LesionCenterHold(deadband_px=12.0 if profile in {"endoscope", "endoscope-dark", "endoscope-deep"} else 4.0)
     bowel_hold = MaskHold()
     bowel_label_hold = LesionCenterHold(deadband_px=8.0)
@@ -185,9 +187,12 @@ def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
             if not ok or frame is None:
                 break
             shown, found, lesion_center = recognize_frame(frame, segmenter, center_hold, bowel_hold, bowel_label_hold)
+            marker = marker_hold.update(detect_marker_frame(frame))
+            shown = draw_marker_frame(shown, marker)
             classes = ",".join(found) if found else "none"
             center_text = f" lesion=({lesion_center[0]},{lesion_center[1]})" if lesion_center is not None else ""
-            label = f"FILE {frame.shape[1]}x{frame.shape[0]} {classes}{center_text}"
+            marker_text = f" aruco={marker.marker_id}" if marker.valid else ""
+            label = f"FILE {frame.shape[1]}x{frame.shape[0]} {classes}{center_text}{marker_text}"
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
             writer.write(shown)
@@ -236,6 +241,7 @@ def main() -> None:
         print("Lesion gate: pale pink dome inside the darker red square.")
 
     segmenter = PhantomMaterialSegmenter(profile=args.profile)
+    marker_hold = MarkerFrameHold()
     center_hold = LesionCenterHold(deadband_px=12.0 if args.profile in {"endoscope", "endoscope-dark", "endoscope-deep"} else 4.0)
     bowel_hold = MaskHold()
     bowel_label_hold = LesionCenterHold(deadband_px=8.0)
@@ -258,11 +264,14 @@ def main() -> None:
                 shown, found, lesion_center = recognize_frame(frame, segmenter, center_hold, bowel_hold, bowel_label_hold)
             else:
                 shown = frame.copy()
+            marker = marker_hold.update(detect_marker_frame(frame))
+            shown = draw_marker_frame(shown, marker)
             status = "REC" if writer is not None else "LIVE"
             mode = "painted" if show_masks else "raw"
             classes = ",".join(found) if found else "none"
             center_text = f" lesion=({lesion_center[0]},{lesion_center[1]})" if lesion_center is not None else ""
-            label = f"{status} {mode} {frame.shape[1]}x{frame.shape[0]} {classes}{center_text}"
+            marker_text = f" aruco={marker.marker_id}" if marker.valid else ""
+            label = f"{status} {mode} {frame.shape[1]}x{frame.shape[0]} {classes}{center_text}{marker_text}"
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(shown, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -279,6 +288,7 @@ def main() -> None:
                 imwrite_unicode(str(path), frame)
                 overlay_path = record_dir / f"endoscope_{stamp}_overlay.png"
                 overlay, found_now, lesion_center_now = recognize_frame(frame, segmenter, center_hold, bowel_hold, bowel_label_hold)
+                overlay = draw_marker_frame(overlay, detect_marker_frame(frame))
                 imwrite_unicode(str(overlay_path), overlay)
                 center_now = f" lesion=({lesion_center_now[0]},{lesion_center_now[1]})" if lesion_center_now is not None else ""
                 print(f"Saved snapshot: {path}")

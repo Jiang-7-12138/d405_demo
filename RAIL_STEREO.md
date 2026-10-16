@@ -17,7 +17,7 @@ Z = f × B / d
 | 内容 | 工业相机 |
 |---|---|
 | 肝、结肠、网膜、胆囊、病灶圆 | 可以。一张彩色图就行，阈值和 D405 的 `painted` 相同 |
-| 每一类的相机坐标 | 两张图重建出深度之后写入 `classes.json` |
+| 每一类的相机坐标 | 先不输出。`classes.json` 目前只记像素数 |
 | 深度伪彩色和点云 | 可以。点云按照片上色，病灶点涂成红色 |
 | 每帧实时更新 | 不行。场景必须静止，停稳拍两张 |
 | 和 D405 一样稠密 | 还不行。光滑的肝脏和白底板容易是黑洞 |
@@ -54,7 +54,7 @@ fy = fx
 python rail_stereo.py segment --image captures/rail_a.png --out-dir captures/rail_classes
 ```
 
-看 `captures/rail_classes/classes.png`。这一步没有深度，`classes.json` 里的 `median_depth_mm` 和 `center_camera_mm` 是空的。
+看 `captures/rail_classes/classes.png`。图上只有类别名，没有像素坐标。`classes.json` 里只有每一类的 `pixels`。
 
 ## 两张图重建
 
@@ -75,24 +75,14 @@ python rail_stereo.py reconstruct --image-a captures/rail_a.png --image-b captur
 | 文件 | 内容 |
 |---|---|
 | `preview.png` | 从左到右：类别图、第一张照片、深度伪彩色。黑色是没匹配上 |
-| `classes.png` | 类别轮廓。病灶圆的半径等于掩膜面积，圆心优先用深度中位数投回的像素 |
-| `classes.json` | 每一类的像素数和坐标 |
+| `classes.png` | 类别轮廓和名字。不标注像素坐标。病灶圆的半径等于掩膜面积 |
+| `classes.json` | 每一类的 `pixels`。像素坐标和相机坐标先不写 |
 | `depth_mm.png` | 16 位深度，单位毫米，0 表示无效 |
 | `depth_m.npy` | 米制深度 |
 | `cloud.ply` | 点云，单位米。可以用 MeshLab 或 Open3D 打开 |
 | `summary.json` | 有效像素、整幅深度中位数，以及同样的类别结果 |
 
-`classes.json` 里每一类：
-
-| 字段 | 含义 |
-|---|---|
-| `pixels` | 掩膜像素数，0 表示没找到 |
-| `centroid_px` | 掩膜重心，像素 |
-| `center_px` | 画出的中心。有深度时是三维中位数投回来的点 |
-| `median_depth_mm` | 该类深度中位数，毫米 |
-| `center_camera_mm` | 相机坐标系 `[x, y, z]`，毫米。`z` 是深度 |
-
-相机坐标：`x` 向右，`y` 向下，`z` 朝前。肾在这套五件体模里没有对应颜色，`kidney` 会一直是 0。
+`classes.json` 里每一类目前只有 `pixels`，0 表示没找到。肾在这套五件体模里没有对应颜色，会一直是 0。像素坐标和相机坐标先不输出。
 
 ## 结果不对时
 
