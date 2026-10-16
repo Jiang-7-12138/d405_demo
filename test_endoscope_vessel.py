@@ -4,7 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from endoscope_viewer import LesionCenterHold, MaskHold
+from endoscope_viewer import LesionCenterHold, MaskHold, recognize_frame
 from visualization import mask_interior_point
 from segmenter import PhantomMaterialSegmenter
 
@@ -66,6 +66,53 @@ class EndoscopeVesselTests(unittest.TestCase):
         # The pale square inside the liver stays with the liver. The colon
         # outside that organ must not.
         self.assertLess(int(np.count_nonzero(masks["liver"] & pale_colon & ~near_liver)), 500)
+
+    def test_dark_lesion_center_stays_on_the_dome(self):
+        cap = cv2.VideoCapture(str(Path("captures/endoscope_20261016_124621.avi")))
+        self.assertTrue(cap.isOpened())
+        segmenter = PhantomMaterialSegmenter(profile="endoscope")
+        hold = LesionCenterHold(deadband_px=12.0)
+        centers = []
+        try:
+            for index in range(60, 301, 40):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = cap.read()
+                self.assertTrue(ok)
+                _, _, center = recognize_frame(frame, segmenter, hold)
+                self.assertIsNotNone(center)
+                centers.append(center)
+        finally:
+            cap.release()
+        self.assertEqual(len(set(centers)), 1)
+        x, y = centers[0]
+        self.assertGreater(x, 180)
+        self.assertLess(x, 230)
+        self.assertGreater(y, 200)
+        self.assertLess(y, 255)
+
+    def test_dark_saturated_dome_center_stays_put(self):
+        cap = cv2.VideoCapture(str(Path("captures/endoscope_20261016_141145.avi")))
+        self.assertTrue(cap.isOpened())
+        segmenter = PhantomMaterialSegmenter(profile="endoscope-dark")
+        hold = LesionCenterHold(deadband_px=12.0)
+        centers = []
+        try:
+            for index in range(0, 90, 15):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = cap.read()
+                self.assertTrue(ok)
+                _, found, center = recognize_frame(frame, segmenter, hold)
+                self.assertIn("lesion", found)
+                self.assertIsNotNone(center)
+                centers.append(center)
+        finally:
+            cap.release()
+        self.assertEqual(len(set(centers)), 1)
+        x, y = centers[0]
+        self.assertGreater(x, 150)
+        self.assertLess(x, 210)
+        self.assertGreater(y, 200)
+        self.assertLess(y, 270)
 
 
 if __name__ == "__main__":

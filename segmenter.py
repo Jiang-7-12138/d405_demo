@@ -439,12 +439,12 @@ class PhantomMaterialSegmenter:
     """
 
     def __init__(self, profile: str = "legacy") -> None:
-        if profile not in {"legacy", "painted", "endoscope", "endoscope-bright"}:
+        if profile not in {"legacy", "painted", "endoscope", "endoscope-bright", "endoscope-dark"}:
             raise ValueError(f"Unknown material profile: {profile}")
         self.profile = profile
 
     def predict_all(self, color_bgr: np.ndarray) -> dict[str, np.ndarray]:
-        if self.profile in {"endoscope", "endoscope-bright"}:
+        if self.profile in {"endoscope", "endoscope-bright", "endoscope-dark"}:
             return self._predict_endoscope(color_bgr)
         if self.profile == "painted":
             return self._predict_painted(color_bgr)
@@ -685,6 +685,8 @@ class PhantomMaterialSegmenter:
 
         if self.profile == "endoscope-bright":
             lesion = self._endoscope_lesion_circle_bright(color_bgr, liver)
+        elif self.profile == "endoscope-dark":
+            lesion = self._endoscope_lesion_circle_dark(color_bgr, liver)
         else:
             lesion = self._endoscope_lesion_circle(color_bgr, liver)
         liver = liver & ~lesion & ~gallbladder & ~vessel & ~omentum
@@ -734,65 +736,147 @@ class PhantomMaterialSegmenter:
 
     @staticmethod
     def _endoscope_lesion_circle(color_bgr: np.ndarray, liver: np.ndarray) -> np.ndarray:
-        """Fit one circle to the raised red dome. The square groove is not the lesion.
+        """Fit one circle to the pale pink dome. The dark groove is not the lesion.
 
-        The dome core is the darkest saturated red. A corner smear of the square
-        is larger but less saturated, and the lit liver is brighter, so neither
-        should take the circle.
+        On this phantom the dome is less saturated and brighter than the square
+        around it (about S 45-115, V 165-220). The grooves are the saturated
+        dark red. Following those grooves made the circle jump around the square.
         """
         circle = np.zeros(liver.shape, dtype=bool)
         if int(np.count_nonzero(liver)) < 500:
             return circle
         hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
         hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-        red = (hue <= 16) | (hue >= 170)
-        # The dome is a saturated core with a paler square around it. The lit
-        # liver has no pale ring, and the red smear at the square's corner is
-        # less saturated than the dome, so it loses when both are candidates.
-        core = liver & red & (sat >= 165) & (val >= 90) & (val <= 175)
+        red = (hue <= 12) | (hue >= 170)
+        core = liver & red & (sat >= 45) & (sat <= 115) & (val >= 165) & (val <= 220)
         core_u8 = cv2.morphologyEx(core.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(core_u8, 8)
-        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
-        best: np.ndarray | None = None
-        best_sat = -1.0
+        core_u8 = cv2.morphologyEx(core_u8, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(core_u8, 8)
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (27, 27))
+        best_score = -1.0
+        seed: tuple[float, float] | None = None
         for idx in range(1, count):
             area = int(stats[idx, cv2.CC_STAT_AREA])
-            if area < 280 or area > 6500:
+            if area < 900 or area > 4500:
                 continue
             width = int(stats[idx, cv2.CC_STAT_WIDTH])
             height = int(stats[idx, cv2.CC_STAT_HEIGHT])
             short = max(1, min(width, height))
-            if max(width, height) / short > 2.4:
+            if max(width, height) / short > 1.9:
                 continue
-            if area / max(1, width * height) < 0.28:
+            if area / max(1, width * height) < 0.32:
                 continue
             comp = labels == idx
-            ring = cv2.dilate(comp.astype(np.uint8), ring_kernel).astype(bool) & ~comp & red
-            if int(np.count_nonzero(ring)) < 80:
+            ring = cv2.dilate(comp.astype(np.uint8), ring_kernel).astype(bool) & ~comp & red & liver
+            if int(np.count_nonzero(ring)) < 60:
                 continue
-            if float(np.median(sat[comp])) - float(np.median(sat[ring])) < 28:
+            sat_gap = float(np.median(sat[ring])) - float(np.median(sat[comp]))
+            val_gap = float(np.median(val[comp])) - float(np.median(val[ring]))
+            # The groove around the dome is darker and more saturated than the dome.
+            if sat_gap < 25 or val_gap < 15:
                 continue
-            sat_med = float(np.median(sat[comp]))
-            if sat_med > best_sat:
-                best_sat = sat_med
-                best = comp
-        if best is None:
+            score = sat_gap + 0.5 * val_gap
+            if score > best_score:
+                best_score = score
+                seed = (float(centroids[idx, 0]), float(centroids[idx, 1]))
+        if seed is None:
             return circle
-        grown = cv2.dilate(best.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
-        grown = grown.astype(bool) & liver & red & (val <= 190) & (sat >= 140)
-        contours, _ = cv2.findContours(grown.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        sx, sy = seed
+        yy, xx = np.ogrid[: liver.shape[0], : liver.shape[1]]
+        near = (xx - sx) ** 2 + (yy - sy) ** 2 <= 42 ** 2
+        body = near & liver & red & (sat <= 140) & (val >= 125) & (val <= 230)
+        body_u8 = cv2.morphologyEx(body.astype(np.uint8) * 255, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        body_u8 = cv2.morphologyEx(body_u8, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats((body_u8 > 0).astype(np.uint8), 8)
+        seed_x, seed_y = int(round(sx)), int(round(sy))
+        if not (0 <= seed_y < labels.shape[0] and 0 <= seed_x < labels.shape[1]) or labels[seed_y, seed_x] == 0:
             return circle
-        (cx, cy), radius = cv2.minEnclosingCircle(max(contours, key=cv2.contourArea))
+        body_comp = labels == labels[seed_y, seed_x]
+        ys, xs = np.nonzero(body_comp)
+        if xs.size < 180:
+            return circle
+        cx = float(np.mean(xs))
+        cy = float(np.mean(ys))
+        dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+        radius = float(np.percentile(dist, 92))
+        radius = float(np.clip(radius, 16.0, 40.0))
         drawn = np.zeros(liver.shape, dtype=np.uint8)
-        cv2.circle(
-            drawn,
-            (int(round(cx)), int(round(cy))),
-            max(12, int(round(radius * 0.92))),
-            255,
-            thickness=cv2.FILLED,
-        )
-        return drawn.astype(bool)
+        cv2.circle(drawn, (int(round(cx)), int(round(cy))), int(round(radius)), 255, thickness=cv2.FILLED)
+        return drawn.astype(bool) & liver
+
+    @staticmethod
+    def _endoscope_lesion_circle_dark(color_bgr: np.ndarray, liver: np.ndarray) -> np.ndarray:
+        """Dark red dome from the 2026-10-16 clip.
+
+        The ring is saturated and dark (about S>=165, V 70-120). The cap in
+        the middle is a little lighter, so it shows up as a round hole. The
+        pale-pink and bright-red gates do not see this dome.
+        """
+        circle = np.zeros(liver.shape, dtype=bool)
+        if int(np.count_nonzero(liver)) < 500:
+            return circle
+        hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+        hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        red = (hue <= 12) | (hue >= 170)
+        ring = liver & red & (sat >= 165) & (val >= 70) & (val <= 120)
+        closed = cv2.morphologyEx(ring.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
+        filled = closed.copy()
+        flood_mask = np.zeros((closed.shape[0] + 2, closed.shape[1] + 2), np.uint8)
+        cv2.floodFill(filled, flood_mask, (0, 0), 255)
+        holes = (filled == 0).astype(np.uint8)
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(holes, 8)
+        best_area = 0
+        center: tuple[float, float] | None = None
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 200 or area > 2500:
+                continue
+            width = int(stats[idx, cv2.CC_STAT_WIDTH])
+            height = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            short = max(1, min(width, height))
+            if max(width, height) / short > 1.6:
+                continue
+            comp = labels == idx
+            if float(np.median(val[comp])) < 100 or float(np.median(sat[comp])) > 190:
+                continue
+            if area > best_area:
+                best_area = area
+                center = (float(centroids[idx, 0]), float(centroids[idx, 1]))
+        if center is None:
+            return circle
+        # The lighter cap sits on the upper slope. The dark body of the dome
+        # extends below it, so the displayed center is the midpoint.
+        sx, sy = center
+        body = liver & red & (sat >= 170) & (val >= 70) & (val <= 115)
+        body_u8 = cv2.morphologyEx(body.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        body_u8 = cv2.morphologyEx(body_u8, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        bcount, blabels, bstats, bcent = cv2.connectedComponentsWithStats(body_u8, 8)
+        body_center: tuple[float, float] | None = None
+        body_area = 0
+        for idx in range(1, bcount):
+            area = int(bstats[idx, cv2.CC_STAT_AREA])
+            if area < 1500:
+                continue
+            width = int(bstats[idx, cv2.CC_STAT_WIDTH])
+            height = int(bstats[idx, cv2.CC_STAT_HEIGHT])
+            short = max(1, min(width, height))
+            if max(width, height) / short > 1.5:
+                continue
+            if np.hypot(float(bcent[idx, 0]) - sx, float(bcent[idx, 1]) - sy) > 80:
+                continue
+            if area > body_area:
+                body_area = area
+                body_center = (float(bcent[idx, 0]), float(bcent[idx, 1]))
+        if body_center is None:
+            radius = float(np.clip(np.sqrt(best_area / np.pi) * 1.8, 20.0, 36.0))
+        else:
+            gap = float(np.hypot(body_center[0] - sx, body_center[1] - sy))
+            sx = (sx + body_center[0]) / 2.0
+            sy = (sy + body_center[1]) / 2.0
+            radius = float(np.clip(gap * 1.3, 28.0, 40.0))
+        drawn = np.zeros(liver.shape, dtype=np.uint8)
+        cv2.circle(drawn, (int(round(sx)), int(round(sy))), int(round(radius)), 255, thickness=cv2.FILLED)
+        return drawn.astype(bool) & liver
 
     @staticmethod
     def _endoscope_lesion_circle_bright(color_bgr: np.ndarray, liver: np.ndarray) -> np.ndarray:

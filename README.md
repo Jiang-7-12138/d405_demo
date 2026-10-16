@@ -115,7 +115,30 @@ python endoscope_viewer.py --index 0
 
 - `s`：保存截图到 `captures/`。
 - `r`：开始/停止录像。
+- `m`：开关器官和病灶识别。
 - `q` 或 `Esc`：退出。
+
+病灶圆顶有三套颜色，不能混用。不写 `--profile` 时用的是亮红色那套。
+
+浅粉色圆顶，比周围方块更浅、更亮（S 45–115，V 165–220）：
+
+```powershell
+python endoscope_viewer.py --index 1 --profile endoscope
+```
+
+亮红色圆顶（S 80–165，V 165–240）：
+
+```powershell
+python endoscope_viewer.py --index 1 --profile endoscope-bright
+```
+
+深红色圆顶，外圈又暗又饱和（S ≥ 165，V 70–120），中间有一块稍亮的圆斑：
+
+```powershell
+python endoscope_viewer.py --index 1 --profile endoscope-dark
+```
+
+圆心会停住，小幅晃动不会跟着改坐标。画面里的圆顶换了颜色，就换上面的命令。
 
 ## 下一步
 
