@@ -168,26 +168,41 @@ def draw_named_masks(
         if mask is None or not np.any(mask):
             continue
         color = default_colors.get(name, (255, 255, 255))
-        layer = np.zeros_like(out)
-        layer[mask.astype(bool)] = color
-        out = cv2.addWeighted(out, 1.0, layer, alpha, 0.0)
-
-        mask_u8 = mask.astype(np.uint8) * 255
-        contour_method = cv2.CHAIN_APPROX_NONE if name == "lesion" else cv2.CHAIN_APPROX_SIMPLE
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, contour_method)
-        if name != "lesion":
-            contours = [c for c in contours if cv2.contourArea(c) >= 40]
-        if not contours:
-            continue
-        largest = max(contours, key=cv2.contourArea)
-        if name == "lesion":
-            anchor = None
-            if centers is not None:
-                anchor = centers.get(name)
-            draw_lesion_size_circle(out, mask, center_px=anchor, color=color)
+        # The vessel mark is a few dozen pixels. A fitted contour hugs the blue
+        # paint and misses the rest of the patch, so draw one box around it.
+        if name == "vessel":
+            ys, xs = np.nonzero(mask.astype(bool))
+            pad = 16
+            x0 = max(0, int(xs.min()) - pad)
+            y0 = max(0, int(ys.min()) - pad)
+            x1 = min(out.shape[1] - 1, int(xs.max()) + pad)
+            y1 = min(out.shape[0] - 1, int(ys.max()) + pad)
+            cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 4, cv2.LINE_AA)
+            cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+            largest = np.array([[[x0, y0]], [[x1, y0]], [[x1, y1]], [[x0, y1]]])
         else:
-            drawn = [smooth_closed_contour(c, radius=42.0) if name == "bowel" else c for c in contours]
-            cv2.drawContours(out, drawn, -1, color, 2, cv2.LINE_AA)
+            layer = np.zeros_like(out)
+            layer[mask.astype(bool)] = color
+            out = cv2.addWeighted(out, 1.0, layer, alpha, 0.0)
+
+            mask_u8 = mask.astype(np.uint8) * 255
+            contour_method = cv2.CHAIN_APPROX_NONE if name == "lesion" else cv2.CHAIN_APPROX_SIMPLE
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, contour_method)
+            if name != "lesion":
+                contours = [c for c in contours if cv2.contourArea(c) >= 40]
+            if not contours:
+                continue
+            largest = max(contours, key=cv2.contourArea)
+            if name == "lesion":
+                anchor = None
+                if centers is not None:
+                    anchor = centers.get(name)
+                draw_lesion_size_circle(out, mask, center_px=anchor, color=color)
+            else:
+                # A wide moving average pulled the colon line inside the organ,
+                # so the tips sat outside the envelope. The mask is already blurred.
+                drawn = [smooth_closed_contour(c, radius=12.0) if name == "bowel" else c for c in contours]
+                cv2.drawContours(out, drawn, -1, color, 2, cv2.LINE_AA)
 
         if label_names is not None and name not in label_names:
             continue

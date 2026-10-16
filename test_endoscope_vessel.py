@@ -114,6 +114,30 @@ class EndoscopeVesselTests(unittest.TestCase):
         self.assertGreater(y, 200)
         self.assertLess(y, 270)
 
+    def test_deep_ringed_dome_center_stays_in_the_square(self):
+        cap = cv2.VideoCapture(str(Path("captures/endoscope_20261016_171248.avi")))
+        self.assertTrue(cap.isOpened())
+        segmenter = PhantomMaterialSegmenter(profile="endoscope-deep")
+        hold = LesionCenterHold(deadband_px=12.0)
+        centers = []
+        try:
+            for index in range(24, 97):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = cap.read()
+                self.assertTrue(ok)
+                _, found, center = recognize_frame(frame, segmenter, hold)
+                self.assertIn("lesion", found)
+                self.assertIsNotNone(center)
+                centers.append(center)
+        finally:
+            cap.release()
+        self.assertEqual(len(set(centers)), 1)
+        x, y = centers[0]
+        self.assertGreater(x, 230)
+        self.assertLess(x, 290)
+        self.assertGreater(y, 190)
+        self.assertLess(y, 250)
+
 
 if __name__ == "__main__":
     unittest.main()

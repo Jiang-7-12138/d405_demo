@@ -26,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile",
         default="endoscope-bright",
-        choices=["endoscope", "endoscope-bright", "endoscope-dark"],
-        help="endoscope is the pale pink dome. endoscope-bright is the bright red dome. endoscope-dark is the dark saturated dome.",
+        choices=["endoscope", "endoscope-bright", "endoscope-dark", "endoscope-deep"],
+        help="endoscope is the pale pink dome. endoscope-bright is the bright red dome. endoscope-dark is the dark dome with a lighter cap. endoscope-deep is the final deep-red ringed dome.",
     )
     return parser.parse_args()
 
@@ -171,7 +171,7 @@ def replay_video(video_path: Path, record_dir: Path, profile: str) -> None:
         raise SystemExit(f"Failed to create overlay video: {out_path}")
 
     segmenter = PhantomMaterialSegmenter(profile=profile)
-    center_hold = LesionCenterHold(deadband_px=12.0 if profile in {"endoscope", "endoscope-dark"} else 4.0)
+    center_hold = LesionCenterHold(deadband_px=12.0 if profile in {"endoscope", "endoscope-dark", "endoscope-deep"} else 4.0)
     bowel_hold = MaskHold()
     bowel_label_hold = LesionCenterHold(deadband_px=8.0)
     print(f"Recognition profile: {profile}")
@@ -230,11 +230,13 @@ def main() -> None:
         print("Lesion gate: bright red dome (H 0-8, S 80-165, V 165-240).")
     elif args.profile == "endoscope-dark":
         print("Lesion gate: dark saturated dome (S>=165, V 70-120) with a lighter cap.")
+    elif args.profile == "endoscope-deep":
+        print("Lesion gate: final deep-red ringed dome (S>=185, V 55-110). Center is the square, not the bright corner.")
     else:
         print("Lesion gate: pale pink dome inside the darker red square.")
 
     segmenter = PhantomMaterialSegmenter(profile=args.profile)
-    center_hold = LesionCenterHold(deadband_px=12.0 if args.profile in {"endoscope", "endoscope-dark"} else 4.0)
+    center_hold = LesionCenterHold(deadband_px=12.0 if args.profile in {"endoscope", "endoscope-dark", "endoscope-deep"} else 4.0)
     bowel_hold = MaskHold()
     bowel_label_hold = LesionCenterHold(deadband_px=8.0)
     show_masks = True

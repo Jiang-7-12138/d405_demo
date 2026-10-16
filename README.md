@@ -118,7 +118,7 @@ python endoscope_viewer.py --index 0
 - `m`：开关器官和病灶识别。
 - `q` 或 `Esc`：退出。
 
-病灶圆顶有三套颜色，不能混用。不写 `--profile` 时用的是亮红色那套。
+病灶圆顶有四套颜色，不能混用。不写 `--profile` 时用的是亮红色那套。
 
 浅粉色圆顶，比周围方块更浅、更亮（S 45–115，V 165–220）：
 
@@ -136,6 +136,12 @@ python endoscope_viewer.py --index 1 --profile endoscope-bright
 
 ```powershell
 python endoscope_viewer.py --index 1 --profile endoscope-dark
+```
+
+最终版深红圆环圆顶，方块里更饱和、更暗（S ≥ 185，V 55–110）。圆心取方块中部，不跟右上角的亮边走：
+
+```powershell
+python endoscope_viewer.py --index 1 --profile endoscope-deep
 ```
 
 圆心会停住，小幅晃动不会跟着改坐标。画面里的圆顶换了颜色，就换上面的命令。
